@@ -1,147 +1,94 @@
 import streamlit as st
 import pandas as pd
 import gspread
-from google.oauth2.service_account import Credentials
 import yfinance as yf
 import time
+from google.oauth2.service_account import Credentials
+from datetime import timedelta, date
 
-# Streamlit-sidinställningar
 st.set_page_config(page_title="Utdelningsranking", layout="wide")
 
-# === Google Sheets inställningar ===
+# === Konstanter ===
 SHEET_URL = st.secrets["SHEET_URL"]
-SHEET_NAME = "Blad1"
+SHEET_NAME = "Bolag"
 
-# Autentisering mot Google Sheets
+# Courtage och växlingsavgifter (standard mini Avanza/Nordnet)
+DEFAULT_FX = {
+    "USD/SEK": 10.50,
+    "CAD/SEK": 7.80,
+    "NOK/SEK": 1.00,
+    "EUR/SEK": 11.50
+}
+DEFAULT_COURTAGE = {
+    "Avanza": 0.0025,  # 0.25%
+    "Nordnet": 0.0025  # 0.25%
+}
+DEFAULT_VXL = 0.0025  # 0.25% växlingsavgift
+
+# Google Sheets-autentisering
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-credentials = Credentials.from_service_account_info(
-    st.secrets["GOOGLE_CREDENTIALS"], scopes=scope
-)
+credentials = Credentials.from_service_account_info(st.secrets["GOOGLE_CREDENTIALS"], scopes=scope)
 client = gspread.authorize(credentials)
 
-# Funktion för att skapa koppling
+# === Koppling ===
 def skapa_koppling():
     return client.open_by_url(SHEET_URL).worksheet(SHEET_NAME)
 
-# Hämta data från Google Sheets
-def hamta_data():
+# === Hämta data från Google Sheets ===
+def hamta_df():
     sheet = skapa_koppling()
     data = sheet.get_all_records()
     return pd.DataFrame(data)
 
-# Spara data till Google Sheets
-def spara_data(df):
+# === Spara data till Google Sheets ===
+def spara_df_säkert(df: pd.DataFrame):
     sheet = skapa_koppling()
     sheet.clear()
-    sheet.update([df.columns.values.tolist()] + df.astype(str).values.tolist())
+    sheet.update([df.columns.tolist()] + df.astype(str).values.tolist())
 
-# === Datakolumner & standarder ===
-BASE_COLS = [
-    "Ticker","Bolagsnamn","Valuta","Aktuell kurs","Kurs (SEK)",
-    "Forward Yield (%)","5Y Avg Yield (%)","Relative Yield (x)",
-    "Forward Div Rate","Trailing Div Rate","Payout Ratio (%)",
-    "Ex-Date","Dagar till X-dag","Senast uppdaterad",
-]
-
-HOLDING_COLS = [
-    "Antal","GAV (SEK)","Marknadsvärde (SEK)",
-    "Utd/aktie (SEK)","Årsutdelning (SEK)","Månadsutdelning (SEK)"
-]
-
-WEIGHT_COLS = ["Minvikt (%)","Målvikt (%)","Maxvikt (%)","Nuvarande vikt (%)"]
-
-SCORE_COLS = ["Poäng","Rank"]
-
-DIV_SCHEDULE_COLS = ["Frekvens/år","Payment-lag (dagar)","Nästa utbetalning (est)"]
-
-FEE_COLS = [
-    # summerade historiska avgifter (frivilligt – fylls på när vi bygger köp/sälj)
-    "Sum courtage (SEK)","Sum FX-avgift (SEK)"
-]
-
-ALL_COLS = BASE_COLS + HOLDING_COLS + WEIGHT_COLS + SCORE_COLS + DIV_SCHEDULE_COLS + FEE_COLS
-
-# Standard FX-kurser (kan ändras i sidopanel senare)
-DEFAULT_FX = {"USD/SEK": 10.00, "CAD/SEK": 7.50, "NOK/SEK": 1.00, "EUR/SEK": 11.00}
-
-# === Hjälp: säkerställ kolumner & defaults ===
+# === Säkerställ kolumner ===
 def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    if df.empty:
-        df = pd.DataFrame(columns=ALL_COLS)
-
-    # lägg till saknade kolumner
-    for c in ALL_COLS:
+    cols = [
+        "Ticker", "Bolagsnamn", "Valuta", "Aktuell kurs", "Forward Yield (%)",
+        "5Y Avg Yield (%)", "Forward Div Rate", "Trailing Div Rate", "Payout Ratio (%)",
+        "Ex-Date", "Frekvens/år", "Payment-lag (dagar)", "Antal",
+        "Kurs (SEK)", "Marknadsvärde (SEK)", "Utd/aktie (SEK)",
+        "Årsutdelning (SEK)", "Månadsutdelning (SEK)", "Relative Yield (x)",
+        "Dagar till X-dag", "Poäng", "Rank", "Nästa utbetalning (est)",
+        "Nuvarande vikt (%)", "Senast uppdaterad"
+    ]
+    for c in cols:
         if c not in df.columns:
             df[c] = ""
-
-    # datatyper & defaults
-    df["Ticker"] = df["Ticker"].astype(str).str.strip().str.upper()
-
-    # numeriska standarder
-    num_defaults = {
-        "Antal": 0, "GAV (SEK)": 0.0, "Marknadsvärde (SEK)": 0.0,
-        "Utd/aktie (SEK)": 0.0, "Årsutdelning (SEK)": 0.0, "Månadsutdelning (SEK)": 0.0,
-        "Minvikt (%)": 3.0, "Målvikt (%)": 10.0, "Maxvikt (%)": 15.0, "Nuvarande vikt (%)": 0.0,
-        "Forward Yield (%)": 0.0, "5Y Avg Yield (%)": 0.0, "Relative Yield (x)": 0.0,
-        "Forward Div Rate": 0.0, "Trailing Div Rate": 0.0, "Payout Ratio (%)": 0.0,
-        "Kurs (SEK)": 0.0, "Aktuell kurs": 0.0, "Dagar till X-dag": 99999,
-        "Poäng": 0.0, "Rank": 0,
-        "Frekvens/år": 4, "Payment-lag (dagar)": 30,
-        "Sum courtage (SEK)": 0.0, "Sum FX-avgift (SEK)": 0.0,
-    }
-    for k, v in num_defaults.items():
-        df[k] = pd.to_numeric(df[k], errors="coerce").fillna(v)
-
-    # textkolumner
-    for k in ["Bolagsnamn","Valuta","Ex-Date","Nästa utbetalning (est)","Senast uppdaterad"]:
-        df[k] = df[k].astype(str).fillna("")
-
-    # håll bara de kolumner vi definierat – och i rätt ordning
-    df = df[ALL_COLS].copy()
-    return df
-
-# === Hämta & spara med kolumnsäkring ===
-def hamta_df_säkert():
-    try:
-        df = hamta_data()
-    except Exception:
-        df = pd.DataFrame()
-    return säkerställ_kolumner(df)
-
-def spara_df_säkert(df: pd.DataFrame):
-    df = säkerställ_kolumner(df)
-    spara_data(df)
+    return df[cols]
 
 # === Yahoo Finance: hämta fält per ticker ===
 def hamta_yahoo(ticker: str) -> dict:
     t = yf.Ticker(ticker)
     info = {}
     try:
-        # yfinance nya API:t – robust mot None
         info = t.get_info() or {}
     except Exception:
         info = {}
 
-    # Hjälpare
     def pct(x):
-        if x in (None, ""): return 0.0
+        if x in (None, "", 0): return 0.0
         try: return round(float(x) * 100.0, 2)
         except: return 0.0
 
     def ts_to_date(ts):
-        if not ts: return ""
+        if ts in (None, "", 0): return ""
         try: return pd.to_datetime(int(ts), unit="s", utc=True).strftime("%Y-%m-%d")
         except: return ""
 
-    # Pris (försök flera källor)
+    # Pris (robust)
     price = None
     try:
         price = t.fast_info.get("last_price")
     except Exception:
         pass
     if price in (None, ""):
-        price = info.get("currentPrice", None)
+        price = info.get("currentPrice")
     if price in (None, ""):
         try:
             h = t.history(period="1d")
@@ -150,7 +97,7 @@ def hamta_yahoo(ticker: str) -> dict:
         except Exception:
             price = None
 
-    data = {
+    return {
         "Bolagsnamn": info.get("longName") or info.get("shortName") or "",
         "Valuta": info.get("currency") or "",
         "Aktuell kurs": float(price) if price not in (None, "") else 0.0,
@@ -162,7 +109,6 @@ def hamta_yahoo(ticker: str) -> dict:
         "Ex-Date": ts_to_date(info.get("exDividendDate")),
         "Senast uppdaterad": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
     }
-    return data
 
 
 # === Beräkningar (SEK, utdelning, Relative Yield, X-dag, poäng) ===
@@ -172,21 +118,19 @@ def beräkna(df: pd.DataFrame, fx_map: dict) -> pd.DataFrame:
     # FX-funktion
     def fx_for(cur: str) -> float:
         c = (cur or "").upper()
-        if c == "USD": return fx_map["USD/SEK"]
-        if c == "CAD": return fx_map["CAD/SEK"]
-        if c == "NOK": return fx_map["NOK/SEK"]
-        if c == "EUR": return fx_map["EUR/SEK"]
-        return 1.0  # SEK standard
+        if c == "USD": return float(fx_map.get("USD/SEK", DEFAULT_FX["USD/SEK"]))
+        if c == "CAD": return float(fx_map.get("CAD/SEK", DEFAULT_FX["CAD/SEK"]))
+        if c == "NOK": return float(fx_map.get("NOK/SEK", DEFAULT_FX["NOK/SEK"]))
+        if c == "EUR": return float(fx_map.get("EUR/SEK", DEFAULT_FX["EUR/SEK"]))
+        return 1.0  # SEK
 
-    # SEK-konvertering
-    d["Kurs (SEK)"] = (d["Aktuell kurs"].astype(float) * d["Valuta"].apply(fx_for)).round(6)
+    # SEK-konvertering & marknadsvärde
+    d["Kurs (SEK)"] = (pd.to_numeric(d["Aktuell kurs"], errors="coerce").fillna(0.0) * d["Valuta"].apply(fx_for)).round(6)
+    d["Marknadsvärde (SEK)"] = (pd.to_numeric(d["Antal"], errors="coerce").fillna(0.0) * d["Kurs (SEK)"]).round(2)
 
-    # Marknadsvärde
-    d["Marknadsvärde (SEK)"] = (d["Antal"].astype(float) * d["Kurs (SEK)"]).round(2)
-
-    # Utd/aktie (SEK) och total utdelning
-    d["Utd/aktie (SEK)"] = (d["Forward Div Rate"].astype(float) * d["Valuta"].apply(fx_for)).round(6)
-    d["Årsutdelning (SEK)"] = (d["Antal"].astype(float) * d["Utd/aktie (SEK)"]).round(2)
+    # Utdelning i SEK
+    d["Utd/aktie (SEK)"] = (pd.to_numeric(d["Forward Div Rate"], errors="coerce").fillna(0.0) * d["Valuta"].apply(fx_for)).round(6)
+    d["Årsutdelning (SEK)"] = (pd.to_numeric(d["Antal"], errors="coerce").fillna(0.0) * d["Utd/aktie (SEK)"]).round(2)
     d["Månadsutdelning (SEK)"] = (d["Årsutdelning (SEK)"] / 12.0).round(2)
 
     # Relative Yield
@@ -197,48 +141,48 @@ def beräkna(df: pd.DataFrame, fx_map: dict) -> pd.DataFrame:
 
     # Dagar till X-dag
     def days_to_ex(s):
-        if not s or s == "": return 99999
-        try:
-            ex = pd.to_datetime(s).date()
-            today = pd.Timestamp.utcnow().date()
-            if ex < today: return 99999
-            return (ex - today).days
-        except Exception:
-            return 99999
+        ts = pd.to_datetime(s, errors="coerce")
+        if pd.isna(ts): return 99999
+        ex = ts.date()
+        today = pd.Timestamp.utcnow().date()
+        if ex < today: return 99999
+        return (ex - today).days
     d["Dagar till X-dag"] = d["Ex-Date"].apply(days_to_ex)
 
-    # Poäng (grund: bara Relative Yield + liten X-dag-bonus när inom 14 dagar)
+    # Poäng (Relative Yield + liten bonus om ex-dag inom 14 dagar)
     x_bonus = d["Dagar till X-dag"].apply(lambda dd: 0.05 if 0 <= dd <= 14 else 0.0)
-    d["Poäng"] = (d["Relative Yield (x)"].astype(float) + x_bonus).round(3)
+    d["Poäng"] = (pd.to_numeric(d["Relative Yield (x)"], errors="coerce").fillna(0.0) + x_bonus).round(3)
 
     # Ranking
     d = d.sort_values(by=["Poäng", "Dagar till X-dag"], ascending=[False, True]).reset_index(drop=True)
     d["Rank"] = d.index + 1
 
-    # Estimera “Nästa utbetalning (est)” baserat på Ex-Date + Payment-lag och Frekvens/år
-    from datetime import timedelta, date
-    def next_pay(ex_str, freq, lag_days):
+    # Robust "Nästa utbetalning (est)" = Ex-date framskjuten per frekvens + payment-lag
+    def next_pay(ex_date_str, freq_per_year, payment_lag_days):
+        ts = pd.to_datetime(ex_date_str, errors="coerce")
+        if pd.isna(ts):
+            return ""
+        exd = ts.date()
         try:
-            freq = int(float(freq))
-        except:
+            freq = int(float(freq_per_year))
+        except Exception:
             freq = 4
         try:
-            lag = int(float(lag_days))
-        except:
+            lag = int(float(payment_lag_days))
+        except Exception:
             lag = 30
-        if not ex_str: return ""
-        try:
-            exd = pd.to_datetime(ex_str).date()
-        except:
-            return ""
-        today = date.today()
-        step = max(1, int(round(365.0 / max(freq, 1))))
-        while exd < today:
-            exd = exd + timedelta(days=step)
-        return (exd + timedelta(days=lag)).strftime("%Y-%m-%d")
+        freq = max(freq, 1)
+        step_days = max(1, int(round(365.0 / freq)))
+
+        today_d = date.today()
+        while exd < today_d:
+            exd = exd + timedelta(days=step_days)
+
+        pay_date = exd + timedelta(days=lag)
+        return pay_date.strftime("%Y-%m-%d")
 
     d["Nästa utbetalning (est)"] = [
-        next_pay(d.at[i,"Ex-Date"], d.at[i,"Frekvens/år"], d.at[i,"Payment-lag (dagar)"]) for i in d.index
+        next_pay(d.at[i, "Ex-Date"], d.at[i, "Frekvens/år"], d.at[i, "Payment-lag (dagar)"]) for i in d.index
     ]
 
     # Nuvarande vikt
@@ -251,25 +195,28 @@ def beräkna(df: pd.DataFrame, fx_map: dict) -> pd.DataFrame:
 # === Sidopanel: FX-inställningar, tickers & Uppdatera alla ===
 def sidopanel(df: pd.DataFrame):
     st.sidebar.header("⚙️ Inställningar")
-    tickers_default = ",".join(df["Ticker"].tolist()) if not df.empty else "EPD,VICI,FTS,XOM,CVX,VZ,MO,USB,MGA,AMCR"
+
+    # Tickers
+    tickers_default = ",".join(df["Ticker"].astype(str).tolist()) if not df.empty else "EPD,VICI,FTS,XOM,CVX,VZ,MO,USB,MGA,AMCR"
     tickers_str = st.sidebar.text_area("Tickers (komma-separerade)", value=tickers_default)
 
+    # Växelkurser
     st.sidebar.markdown("**Växelkurser**")
     fx_map = {}
     for k, v in DEFAULT_FX.items():
         fx_map[k] = float(st.sidebar.text_input(k, value=str(v)))
 
     do_update = st.sidebar.button("🔄 Uppdatera alla från Yahoo")
-    return [t.strip().upper() for t in tickers_str.split(",") if t.strip()], fx_map, do_update
+    tickers = [t.strip().upper() for t in tickers_str.split(",") if t.strip()]
+    return tickers, fx_map, do_update
 
 
 # === Säkerställ att rader finns för alla tickers ===
 def säkerställ_tickers(df: pd.DataFrame, tickers: list) -> pd.DataFrame:
-    d = säkerställ_kolumner(df)
+    d = säkerställ_kolumner(df).copy()
     for t in tickers:
         if not (d["Ticker"] == t).any():
-            d = pd.concat([d, pd.DataFrame([{"Ticker": t}])], ignore_index=True)
-    # städa bort blank-ticker-rader
+            d = pd.concat([d, pd.DataFrame([{"Ticker": t, "Antal": 0}])], ignore_index=True)
     d = d[d["Ticker"].astype(bool)].reset_index(drop=True)
     return d
 
@@ -345,12 +292,11 @@ def block_portfolio(df: pd.DataFrame, fx_map: dict) -> pd.DataFrame:
     edited = st.data_editor(view, hide_index=True, num_rows="dynamic", use_container_width=True)
 
     if st.button("💾 Spara portfölj (antal, GAV, vikter & schema)"):
-        # Skriv tillbaka ändringarna för de redigerbara kolumnerna
-        base = hamta_df_säkert()
+        base = säkerställ_kolumner(hamta_df())
         for _, r in edited.iterrows():
             t = r["Ticker"]
             mask = base["Ticker"] == t
-            if not mask.any():  # rad kan ha lagts till i visningen
+            if not mask.any():
                 continue
             for c in edit_cols:
                 base.loc[mask, c] = r[c]
@@ -373,7 +319,7 @@ def block_ranking(df: pd.DataFrame):
     ]
     st.dataframe(df[cols], use_container_width=True)
 
-# === UI: enkel köp-simulering (utan avgifter, vi lägger till avgifter i Del 5) ===
+# === UI: enkel köp-simulering (utan avgifter – vi lägger på avgifter i Del 4) ===
 def block_buy_sim(df: pd.DataFrame):
     st.subheader("🛒 Köp-simulering (enkel)")
     amount = st.number_input("Belopp (SEK)", min_value=0, value=900, step=100)
@@ -413,24 +359,22 @@ def block_buy_sim(df: pd.DataFrame):
 # === Avgifter (Mini) ===
 MIN_COURTAGE_RATE = 0.0025   # 0,25 %
 MIN_COURTAGE_SEK  = 1.0      # minst 1 kr
-FX_FEE_RATE       = 0.0025   # 0,25 % växlingsavgift (om ej SEK)
+FX_FEE_RATE       = 0.0025   # 0,25 % växling när ej SEK
 
 def is_foreign(ccy: str) -> bool:
     return (str(ccy or "").upper() != "SEK")
 
-def calc_fees(order_value_sek: float, foreign: bool) -> tuple[float,float,float]:
-    """Return (courtage, fx_fee, total_fees) in SEK."""
+def calc_fees(order_value_sek: float, foreign: bool):
     courtage = max(MIN_COURTAGE_RATE * order_value_sek, MIN_COURTAGE_SEK)
     fx_fee   = (FX_FEE_RATE * order_value_sek) if foreign else 0.0
     total    = round(courtage + fx_fee, 2)
     return round(courtage,2), round(fx_fee,2), total
 
-
-# === Transaktions-logg (Google Sheets flik "Transaktioner") ===
+# === Transaktionslogg (flik "Transaktioner") ===
 TX_SHEET = "Transaktioner"
 
 def ensure_tx_sheet():
-    sh = skapa_koppling().spreadsheet  # hämta Spreadsheet-objekt
+    sh = skapa_koppling().spreadsheet
     import gspread
     try:
         ws_tx = sh.worksheet(TX_SHEET)
@@ -450,21 +394,16 @@ def log_tx(tx_type, ticker, qty, px_local, ccy, fx_used, px_sek, gross_sek, fee_
         px_sek, gross_sek, fee_court, fee_fx, round(fee_court+fee_fx,2), note
     ])
 
-
-# === Hjälp: uppdatera GAV och summera avgifter ===
+# === Position-uppdatering ===
 def update_position_after_buy(df: pd.DataFrame, idx: int, qty: int, total_cost_sek: float,
                               fee_court: float, fee_fx: float):
     old_qty = float(df.at[idx, "Antal"] or 0)
     old_gav = float(df.at[idx, "GAV (SEK)"] or 0)
     new_qty = old_qty + qty
-
-    # Inkludera avgifter i anskaffningsvärdet (vanligt i privat portfölj)
     new_gav = 0.0 if new_qty == 0 else round(((old_gav * old_qty) + total_cost_sek) / new_qty, 6)
 
     df.at[idx, "Antal"] = new_qty
     df.at[idx, "GAV (SEK)"] = new_gav
-
-    # Summera avgifter
     df.at[idx, "Sum courtage (SEK)"]  = round(float(df.at[idx, "Sum courtage (SEK)"] or 0) + fee_court, 2)
     df.at[idx, "Sum FX-avgift (SEK)"] = round(float(df.at[idx, "Sum FX-avgift (SEK)"] or 0) + fee_fx, 2)
     return df
@@ -478,13 +417,11 @@ def update_position_after_sell(df: pd.DataFrame, idx: int, qty: int,
     df.at[idx, "Antal"] = new_qty
     if new_qty == 0:
         df.at[idx, "GAV (SEK)"] = 0.0
-
     df.at[idx, "Sum courtage (SEK)"]  = round(float(df.at[idx, "Sum courtage (SEK)"] or 0) + fee_court, 2)
     df.at[idx, "Sum FX-avgift (SEK)"] = round(float(df.at[idx, "Sum FX-avgift (SEK)"] or 0) + fee_fx, 2)
     return df
 
-
-# === UI: Köp med avgifter + logg ===
+# === UI: Köp (med avgifter & logg) ===
 def block_buy(df: pd.DataFrame, fx_map: dict) -> pd.DataFrame:
     st.subheader("🛒 Köp (med Mini-courtage & växlingsavgift)")
     if df.empty:
@@ -505,12 +442,12 @@ def block_buy(df: pd.DataFrame, fx_map: dict) -> pd.DataFrame:
                            index=["SEK","USD","CAD","NOK","EUR"].index(cur) if cur in ["SEK","USD","CAD","NOK","EUR"] else 1,
                            key="buy_ccy")
 
-    # FX till SEK
+    # FX till SEK (från sidopanelens värden)
     fx_used = 1.0
-    if ccy == "USD": fx_used = float(DEFAULT_FX["USD/SEK"])
-    elif ccy == "CAD": fx_used = float(DEFAULT_FX["CAD/SEK"])
-    elif ccy == "NOK": fx_used = float(DEFAULT_FX["NOK/SEK"])
-    elif ccy == "EUR": fx_used = float(DEFAULT_FX["EUR/SEK"])
+    if ccy == "USD": fx_used = float(fx_map.get("USD/SEK", DEFAULT_FX["USD/SEK"]))
+    elif ccy == "CAD": fx_used = float(fx_map.get("CAD/SEK", DEFAULT_FX["CAD/SEK"]))
+    elif ccy == "NOK": fx_used = float(fx_map.get("NOK/SEK", DEFAULT_FX["NOK/SEK"]))
+    elif ccy == "EUR": fx_used = float(fx_map.get("EUR/SEK", DEFAULT_FX["EUR/SEK"]))
 
     px_sek = round(px_local * fx_used, 6)
     gross  = round(px_sek * qty, 2)
@@ -522,18 +459,14 @@ def block_buy(df: pd.DataFrame, fx_map: dict) -> pd.DataFrame:
 
     if st.button("➕ Genomför köp"):
         i = df.index[df["Ticker"] == tkr][0]
-        # uppdatera position (inkl. avgifter i anskaffning)
         df = update_position_after_buy(df, i, qty, net, fee_court, fee_fx)
-        # logga transaktion
         log_tx("KÖP", tkr, qty, px_local, ccy, fx_used, px_sek, gross, fee_court, fee_fx, note="app")
-        # räkna om & spara
-        df = beräkna(df, DEFAULT_FX)
+        df = beräkna(df, fx_map)
         spara_df_säkert(df)
         st.success(f"Köp klart: {qty} {tkr}. Avgifter {fee_total} SEK. GAV uppdaterad.")
     return df
 
-
-# === UI: Sälj med avgifter + logg ===
+# === UI: Sälj (med avgifter & logg) ===
 def block_sell(df: pd.DataFrame, fx_map: dict) -> pd.DataFrame:
     st.subheader("📤 Sälj (med Mini-courtage & växlingsavgift)")
     if df.empty:
@@ -554,40 +487,34 @@ def block_sell(df: pd.DataFrame, fx_map: dict) -> pd.DataFrame:
                            index=["SEK","USD","CAD","NOK","EUR"].index(cur) if cur in ["SEK","USD","CAD","NOK","EUR"] else 1,
                            key="sell_ccy")
 
-    # FX till SEK
     fx_used = 1.0
-    if ccy == "USD": fx_used = float(DEFAULT_FX["USD/SEK"])
-    elif ccy == "CAD": fx_used = float(DEFAULT_FX["CAD/SEK"])
-    elif ccy == "NOK": fx_used = float(DEFAULT_FX["NOK/SEK"])
-    elif ccy == "EUR": fx_used = float(DEFAULT_FX["EUR/SEK"])
+    if ccy == "USD": fx_used = float(fx_map.get("USD/SEK", DEFAULT_FX["USD/SEK"]))
+    elif ccy == "CAD": fx_used = float(fx_map.get("CAD/SEK", DEFAULT_FX["CAD/SEK"]))
+    elif ccy == "NOK": fx_used = float(fx_map.get("NOK/SEK", DEFAULT_FX["NOK/SEK"]))
+    elif ccy == "EUR": fx_used = float(fx_map.get("EUR/SEK", DEFAULT_FX["EUR/SEK"]))
 
     px_sek = round(px_local * fx_used, 6)
     gross  = round(px_sek * qty, 2)
     fee_court, fee_fx, fee_total = calc_fees(gross, is_foreign(ccy))
-    net    = round(gross - fee_total, 2)  # likvid efter avgifter (informativt)
+    net    = round(gross - fee_total, 2)
 
     st.caption(f"Pris (SEK): **{px_sek}**  |  Brutto: **{gross} SEK**  |  "
                f"Courtage: **{fee_court}**  |  FX-avgift: **{fee_fx}**  |  Nettolikvid: **{net} SEK**")
 
     if st.button("➖ Genomför sälj"):
         i = df.index[df["Ticker"] == tkr][0]
-        # validera antal
         if qty > float(df.at[i, "Antal"] or 0):
             st.error("Du kan inte sälja fler aktier än du äger.")
             return df
-        # uppdatera position (avgifter minskar bara likvid, GAV påverkas inte bakåt)
         df = update_position_after_sell(df, i, qty, fee_court, fee_fx)
-        # logga transaktion
         log_tx("SÄLJ", tkr, -qty, px_local, ccy, fx_used, px_sek, gross, fee_court, fee_fx, note="app")
-        # räkna om & spara
-        df = beräkna(df, DEFAULT_FX)
+        df = beräkna(df, fx_map)
         spara_df_säkert(df)
         st.success(f"Sälj klart: {qty} {tkr}. Avgifter {fee_total} SEK. Kvar: {int(df.at[i,'Antal'])} st.")
     return df
 
-
-# === (Valfritt) Köp-simulering med avgifter ===
-def block_buy_sim_with_fees(df: pd.DataFrame):
+# === Köp-simulering med avgifter (valfritt) ===
+def block_buy_sim_with_fees(df: pd.DataFrame, fx_map: dict):
     st.subheader("🎯 Köp-simulering (med avgifter)")
     amount = st.number_input("Belopp (SEK)", min_value=0, value=900, step=100, key="sim_amount")
     if st.button("Beräkna förslag"):
@@ -603,7 +530,6 @@ def block_buy_sim_with_fees(df: pd.DataFrame):
         if price <= 0:
             st.info("Saknar prisdata för toppkandidat.")
             return
-        # iterera för att hitta qty som ryms inkl avgifter
         ccy   = r["Valuta"]
         qty   = 0
         while True:
@@ -623,12 +549,15 @@ def block_buy_sim_with_fees(df: pd.DataFrame):
                    f"Courtage {fee_court}, FX-avgift {fee_fx}")
 
 def main():
-    st.title("Relative Yield – utdelningsåterinvestering (med avgifter & transaktioner)")
+    st.title("Relative Yield – utdelningsåterinvestering (avgifter & transaktioner)")
 
-    df = hamta_df_säkert()
-    tickers, fx_map, do_update = sidopanel(df)
-    df = säkerställ_tickers(df, tickers)
+    # Läs in & sidopanel
+    raw = hamta_df()
+    raw = säkerställ_kolumner(raw)
+    tickers, fx_map, do_update = sidopanel(raw)
+    df = säkerställ_tickers(raw, tickers)
 
+    # Uppdatera alla om man klickar
     if do_update and tickers:
         df = block_uppdatera_alla(df, tickers, fx_map)
 
@@ -643,7 +572,7 @@ def main():
     st.divider(); df = block_sell(df, fx_map)
 
     # Köp-simulering med avgifter
-    st.divider(); block_buy_sim_with_fees(beräkna(hamta_df_säkert(), fx_map))  # läs om efter ev. transaktion
+    st.divider(); block_buy_sim_with_fees(beräkna(hamta_df(), fx_map), fx_map)
 
 if __name__ == "__main__":
     main()
