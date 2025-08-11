@@ -494,17 +494,7 @@ def trim_suggestions(df: pd.DataFrame) -> pd.DataFrame:
                          "Föreslagen sälj (st)": n, "Nettolikvid ca (SEK)": net, "Kommentar": f"Ner till {GLOBAL_MAX_NAME:.0f}%"})
     return pd.DataFrame(rows)
 
-# ── Köpförslag (respekterar 12 % & kategori-tak & kassa) ───────────────────
-def _max_affordable_shares(price_sek: float, cash_sek: float, foreign: bool) -> int:
-    if price_sek <= 0 or cash_sek <= 0: return 0
-    n_hi = int(cash_sek // price_sek)
-    if n_hi <= 0: return 0
-    for n in range(n_hi, 0, -1):
-        gross = price_sek * n
-        c, fx, tot = calc_fees(gross, foreign)
-        if gross + tot <= cash_sek + 1e-9: return n
-    return 0
-
+# ── Köpförslag – KASSA IGNORERAS ───────────────────────────────────────────
 def _cap_shares_by_weight_limit(Vi: float, T: float, price_sek: float, max_pct: float) -> int:
     if price_sek <= 0: return 0
     m = max_pct / 100.0; numer = m*T - Vi; denom = (1.0 - m) * price_sek
@@ -517,10 +507,25 @@ def _cap_shares_by_category(C: float, T: float, price_sek: float, cat_max_pct: f
     if denom <= 0: return 0
     return int(max(0, math.floor(numer / denom)))
 
-def suggest_buys(df: pd.DataFrame, cash_sek: float, w_val: float=0.5, w_under: float=0.35, w_time: float=0.15, topk: int=5) -> pd.DataFrame:
+def suggest_buys(df: pd.DataFrame,
+                 w_val: float=0.5, w_under: float=0.35, w_time: float=0.15,
+                 topk: int=5, allow_margin: float=0.1, return_debug: bool=False):
+    """
+    Köpförslag IGNORERAR kassa helt.
+    Rankar kandidater och föreslår köp som ryms under:
+      - GLOBAL_MAX_NAME (ex 12%) + liten marginal (allow_margin, p-enheter)
+      - Kategori-tak (MAX_CAT)
+    Returnerar:
+      - Rek. (st) = 1 (minsta steg – alltid konkret)
+      - Max enl. regler (st) = teoretiskt max enligt vikt/kategori
+    """
     d = beräkna(df).copy()
-    if d.empty or cash_sek <= 0:
-        return pd.DataFrame(columns=["Ticker","Kategori","Poäng","DA %","Vikt %","Nästa utb","Föreslagna st","Kostnad ca","Motivering"])
+    cols = ["Ticker","Kategori","Poäng","DA %","Vikt %","Nästa utb",
+            "Rek. (st)","Max enl. regler (st)","Kostnad 1 st (SEK)","Motivering"]
+    if d.empty:
+        diag = pd.DataFrame(columns=["Ticker","Skäl"])
+        return (pd.DataFrame(columns=cols), diag) if return_debug else pd.DataFrame(columns=cols)
+
     T = float(d["Marknadsvärde (SEK)"].sum())
     d["Kategori"] = d["Kategori"].astype(str).replace({"": "QUALITY"})
     cat_values = d.groupby("Kategori", as_index=False)["Marknadsvärde (SEK)"].sum().set_index("Kategori")["Marknadsvärde (SEK)"].to_dict()
@@ -545,35 +550,71 @@ def suggest_buys(df: pd.DataFrame, cash_sek: float, w_val: float=0.5, w_under: f
     total_score = (w_val*da_score + w_under*under_score + w_time*time_score)
 
     order = total_score.sort_values(ascending=False).index
-    rows, used = [], 0.0
+    rows, reasons = [], []
+    eps = float(allow_margin)
+
     for i in order:
-        tkr = d.at[i,"Ticker"]
+        tkr = str(d.at[i,"Ticker"])
         price = float(pd.to_numeric(d.at[i,"Kurs (SEK)"], errors="coerce") or 0.0)
-        if price <= 0: continue
+        if price <= 0:
+            reasons.append({"Ticker": tkr, "Skäl": "Pris saknas/0"})
+            continue
+
         cat = str(d.at[i,"Kategori"]) if str(d.at[i,"Kategori"]).strip() else "QUALITY"
-        Vi = float(d.at[i,"Marknadsvärde (SEK)"]); C = float(cat_values.get(cat, 0.0))
+        Vi  = float(d.at[i,"Marknadsvärde (SEK)"])
+        C   = float(cat_values.get(cat, 0.0))
         foreign = str(d.at[i,"Valuta"]).upper() != "SEK"
 
-        n_name_cap = _cap_shares_by_weight_limit(Vi, T, price, GLOBAL_MAX_NAME)
-        n_cat_cap  = _cap_shares_by_category(C, T, price, get_cat_max(cat))
-        remaining_cash = max(0.0, cash_sek - used)
-        n_cash_cap = _max_affordable_shares(price, remaining_cash, foreign)
+        # Teoretiska tak (T kan vara 0)
+        if T <= 0:
+            n_name_cap = 10**9
+            n_cat_cap  = 10**9
+        else:
+            n_name_cap = _cap_shares_by_weight_limit(Vi, T, price, GLOBAL_MAX_NAME + eps)
+            n_cat_cap  = _cap_shares_by_category(C, T, price, get_cat_max(cat))
 
-        n = min(n_name_cap, n_cat_cap, n_cash_cap)
-        if n <= 0: continue
+        n_max = int(max(0, min(n_name_cap, n_cat_cap)))
+        if n_max <= 0:
+            # testa om 1 st funkar ändå (vid liten portfölj eller nära gräns)
+            Vi2 = Vi + price
+            T2  = T + price if T > 0 else price
+            w_after = 100.0 * Vi2 / T2 if T2 > 0 else 0.0
+            if T > 0 and w_after > (GLOBAL_MAX_NAME + eps) + 1e-9:
+                reasons.append({"Ticker": tkr, "Skäl": f"Skulle överskrida {GLOBAL_MAX_NAME:.1f}% (+marg)"})
+                continue
+            C2 = C + price
+            if T > 0:
+                cat_after = 100.0 * C2 / (T + price)
+                if cat_after > get_cat_max(cat) + 1e-9:
+                    reasons.append({"Ticker": tkr, "Skäl": "Överskrider kategori-tak"})
+                    continue
+            n_max = 1  # minst 1 st
 
-        gross = price * n
-        c, fx, tot = calc_fees(gross, foreign)
-        cost = round(gross + tot, 2)
-        rows.append({"Ticker": tkr, "Kategori": cat, "Poäng": round(float(total_score.at[i]), 1),
-                     "DA %": round(float(da.at[i]), 2), "Vikt %": float(d.at[i,"Portföljandel (%)"]),
-                     "Nästa utb": d.at[i,"Nästa utbetalning (est)"], "Föreslagna st": int(n),
-                     "Kostnad ca": cost, "Motivering": f"Undervikt vs {GLOBAL_MAX_NAME:.0f}% & kategori≤{get_cat_max(cat):.0f}%"})
-        used += cost; Vi += gross; C += gross; T += gross; cat_values[cat] = C
-        if used >= cash_sek - 1e-9 or len(rows) >= topk: break
+        n_reco = 1  # minsta steg
 
-    cols = ["Ticker","Kategori","Poäng","DA %","Vikt %","Nästa utb","Föreslagna st","Kostnad ca","Motivering"]
-    return pd.DataFrame(rows)[cols] if rows else pd.DataFrame(columns=cols)
+        gross1 = price * 1
+        c1, fx1, tot1 = calc_fees(gross1, foreign)
+        cost1 = round(gross1 + tot1, 2)
+
+        rows.append({
+            "Ticker": tkr,
+            "Kategori": cat,
+            "Poäng": round(float(total_score.at[i]), 1),
+            "DA %": round(float(da.at[i]), 2),
+            "Vikt %": float(d.at[i,"Portföljandel (%)"]),
+            "Nästa utb": d.at[i,"Nästa utbetalning (est)"],
+            "Rek. (st)": int(n_reco),
+            "Max enl. regler (st)": int(n_max),
+            "Kostnad 1 st (SEK)": cost1,
+            "Motivering": f"Inom {GLOBAL_MAX_NAME:.0f}% (+{eps:.1f}p) & kategori≤{get_cat_max(cat):.0f}%"
+        })
+
+        if len(rows) >= topk:
+            break
+
+    out = pd.DataFrame(rows)[cols] if rows else pd.DataFrame(columns=cols)
+    diag = pd.DataFrame(reasons) if reasons else pd.DataFrame(columns=["Ticker","Skäl"])
+    return (out, diag) if return_debug else out
 
 # ── Portföljöversikt (visa & redigera) ─────────────────────────────────────
 def portfolj_oversikt(df: pd.DataFrame) -> pd.DataFrame:
@@ -710,29 +751,39 @@ def portfolj_oversikt(df: pd.DataFrame) -> pd.DataFrame:
             st.dataframe(trims, use_container_width=True)
     return d
 
-# ── Köpförslag-sida ────────────────────────────────────────────────────────
+# ── Köpförslag-sida (kassalös) ─────────────────────────────────────────────
 def page_buy_suggestions(df: pd.DataFrame):
-    st.subheader("🎯 Köpförslag (tar hänsyn till 12%/kategori & kassa)")
+    st.subheader("🎯 Köpförslag (kassa ignoreras – bästa alternativ just nu)")
+
     c1, c2, c3, c4 = st.columns([1,1,1,1])
     with c1:
-        cash = st.number_input("Tillgänglig kassa (SEK)", min_value=0.0, value=5000.0, step=100.0)
-    with c2:
         w_val = st.slider("Vikt: Värdering (DA)", 0.0, 1.0, 0.50, 0.05)
-    with c3:
+    with c2:
         w_under = st.slider("Vikt: Undervikt mot 12%", 0.0, 1.0, 0.35, 0.05)
-    with c4:
+    with c3:
         w_time = st.slider("Vikt: Timing (nära utdelning)", 0.0, 1.0, 0.15, 0.05)
-
-    totw = max(1e-9, (w_val + w_under + w_time))
-    w_val, w_under, w_time = w_val/totw, w_under/totw, w_time/totw
+    with c4:
+        allow_margin = st.number_input("Marginal över 12%-tak (p)", min_value=0.0, value=0.1, step=0.1,
+                                       help="Tillåt slutvikt upp till t.ex. 12.1% för avrundningsbrus.")
 
     if st.button("Beräkna köpförslag"):
-        sug = suggest_buys(df, cash_sek=cash, w_val=w_val, w_under=w_under, w_time=w_time, topk=5)
+        sug, diag = suggest_buys(
+            df,
+            w_val=w_val, w_under=w_under, w_time=w_time,
+            topk=5, allow_margin=allow_margin, return_debug=True
+        )
+
         if sug.empty:
-            st.info("Ingen kandidat ryms i kassan eller skulle passera 12%/kategori-tak.")
+            st.info("Inga köpförslag just nu som klarar reglerna.")
+            if not diag.empty:
+                with st.expander("Varför blev det inga förslag? (diagnostik)"):
+                    st.dataframe(diag, use_container_width=True)
         else:
             st.dataframe(sug, use_container_width=True)
-            st.caption("Poäng = DA + undervikt mot 12% + hur nära nästa utdelning.")
+            st.caption("“Rek. (st)” = minsta steg (1 st) – alltid ett konkret förslag. “Max enl. regler (st)” visar hur långt du kan gå utan att slå i taken.")
+            if not diag.empty:
+                with st.expander("Ticker-kandidater som stoppades (diagnostik)"):
+                    st.dataframe(diag, use_container_width=True)
 
 # ── Trading (Köp/Sälj) med avgifter & transaktionslogg ─────────────────────
 MIN_COURTAGE_RATE = 0.0025
@@ -963,7 +1014,7 @@ def page_save_now(df: pd.DataFrame):
         st.success("Data (och ev. transaktioner) sparade till Google Sheets!")
     return preview
 
-# ── Menyer som använder Del 2-funktioner ───────────────────────────────────
+# ── Menyer – wrapper ───────────────────────────────────────────────────────
 def page_add_or_update():
     base = säkerställ_kolumner(st.session_state.get("working_df", pd.DataFrame()))
     st.session_state["working_df"] = lagg_till_eller_uppdatera(base)
