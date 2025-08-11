@@ -274,70 +274,79 @@ def sidopanel(df: pd.DataFrame):
     if st.sidebar.button("🔄 Uppdatera EN"):
         st.session_state["working_df"] = add_or_update_ticker_row(one_ticker)
 
-# ── Sida: Lägg till bolag ──────────────────────────────────────────────────
+# ── Sida: Lägg till bolag (Ticker obligatorisk, Antal & GAV får vara 0) ───
 def page_add_company(df: pd.DataFrame) -> pd.DataFrame:
     st.subheader("➕ Lägg till bolag")
-    col1, col2, col3 = st.columns([1.2, 1, 1])
+
+    col1, col2, col3 = st.columns([1.3, 1, 1])
     with col1:
-        tkr = st.text_input("Ticker", placeholder="t.ex. VICI eller 2020.OL").strip().upper()
-        namn = st.text_input("Bolagsnamn (valfritt – hämtas annars från Yahoo)", value="")
-        valuta = st.selectbox("Valuta", ["SEK","USD","EUR","CAD","NOK"], index=0)
+        tkr = st.text_input("Ticker *", placeholder="t.ex. VICI eller 2020.OL").strip().upper()
     with col2:
         qty = st.number_input("Antal aktier", min_value=0, value=0, step=1)
-        gav = st.number_input("GAV (SEK)", min_value=0.0, value=0.0, step=0.01)
     with col3:
-        freq = st.number_input("Frekvens/år", min_value=1, value=4, step=1)
-        lagd = st.number_input("Payment-lag (dagar)", min_value=0, value=30, step=1)
+        gav = st.number_input("GAV (SEK)", min_value=0.0, value=0.0, step=0.01)
 
-    c1, c2, _ = st.columns(3)
+    st.caption("Enda obligatoriska fältet är Ticker. Antal och GAV får vara 0. Övrig data hämtas från Yahoo vid sparning.")
+
+    c1, c2 = st.columns(2)
     with c1:
-        if st.button("🌐 Hämta data från Yahoo"):
-            df = add_or_update_ticker_row(tkr)
-            base = säkerställ_kolumner(df)
-            m = base["Ticker"] == tkr
-            if m.any():
-                if namn: base.loc[m, "Bolagsnamn"] = namn
-                base.loc[m, "Valuta"] = valuta
-                base.loc[m, "Antal aktier"] = qty
-                base.loc[m, "GAV"] = gav
-                base.loc[m, "Frekvens/år"] = freq
-                base.loc[m, "Payment-lag (dagar)"] = lagd
-                df = beräkna(base)
-            st.success(f"{tkr} hämtad och uppdaterad i minnet.")
+        if st.button("🌐 Hämta från Yahoo (förhandsgranskning)"):
+            if not tkr:
+                st.error("Ange Ticker först.")
+            else:
+                _tmp = säkerställ_kolumner(df)
+                if not (_tmp["Ticker"] == tkr).any():
+                    _tmp = pd.concat([_tmp, pd.DataFrame([{"Ticker": tkr}])], ignore_index=True)
+                try:
+                    vals = hamta_yahoo(tkr)
+                    for k, v in vals.items():
+                        _tmp.loc[_tmp["Ticker"] == tkr, k] = v
+                    df = _tmp
+                    st.success(f"Hämtade Yahoo-data för {tkr}. Detta sparas först när du trycker 'Spara NU'.")
+                except Exception as e:
+                    st.warning(f"Kunde inte hämta data: {e}")
+
     with c2:
-        if st.button("➕ Lägg till/uppdatera manuellt"):
-            base = säkerställ_kolumner(df)
-            if tkr:
-                if (base["Ticker"] == tkr).any():
-                    i = base.index[base["Ticker"] == tkr][0]
-                    if namn: base.at[i, "Bolagsnamn"] = namn
-                    base.at[i, "Valuta"] = valuta
-                    base.at[i, "Antal aktier"] = qty
-                    base.at[i, "GAV"] = gav
-                    base.at[i, "Frekvens/år"] = freq
-                    base.at[i, "Payment-lag (dagar)"] = lagd
-                else:
-                    base = pd.concat([base, pd.DataFrame([{
-                        "Ticker": tkr, "Bolagsnamn": namn, "Valuta": valuta,
-                        "Antal aktier": qty, "GAV": gav, "Frekvens/år": freq,
-                        "Payment-lag (dagar)": lagd
-                    }])], ignore_index=True)
-                df = beräkna(base)
-                st.success(f"{tkr} sparad i minnet.")
-
-    st.divider()
-    st.caption("Förhandsgranskning")
-    st.dataframe(beräkna(df)[["Ticker","Bolagsnamn","Valuta","Antal aktier","GAV","Utdelning/år","Kurs (SEK)","Årlig utdelning (SEK)"]], use_container_width=True)
-
-    # ✅ Direkt-spara här om du vill
-    st.divider()
-    colS, _ = st.columns([1,1])
-    with colS:
         if st.button("💾 Spara NU till Google Sheets"):
-            preview = beräkna(säkerställ_kolumner(df))
-            spara_df(preview)
-            st.success("Bolaget/raderna är nu sparade till Google Sheets!")
+            if not tkr:
+                st.error("Ticker är obligatoriskt.")
+                return df
 
+            base = säkerställ_kolumner(df)
+
+            # upsert rad med Antal & GAV (0 tillåtet)
+            if (base["Ticker"] == tkr).any():
+                i = base.index[base["Ticker"] == tkr][0]
+                base.at[i, "Antal aktier"] = float(qty)
+                base.at[i, "GAV"] = float(gav)
+            else:
+                base = pd.concat([base, pd.DataFrame([{
+                    "Ticker": tkr, "Antal aktier": float(qty), "GAV": float(gav)
+                }])], ignore_index=True)
+
+            # hämta/uppdatera övriga fält från Yahoo
+            try:
+                vals = hamta_yahoo(tkr)
+                for k, v in vals.items():
+                    base.loc[base["Ticker"] == tkr, k] = v
+            except Exception as e:
+                st.warning(f"Kunde inte hämta Yahoo-data just nu ({e}). Sparar ändå Ticker/Antal/GAV.")
+
+            base = beräkna(base)
+
+            # skriv direkt till Google Sheets
+            spara_df(base)
+            st.session_state["working_df"] = base
+            st.success(f"{tkr} sparad till Google Sheets.")
+
+            return base
+
+    st.divider()
+    st.caption("Förhandsgranskning (in-memory)")
+    st.dataframe(
+        beräkna(säkerställ_kolumner(df))[["Ticker","Bolagsnamn","Valuta","Antal aktier","GAV","Aktuell kurs","Utdelning/år","Kurs (SEK)","Årlig utdelning (SEK)"]],
+        use_container_width=True
+    )
     return df
 
 # ── Sida: Uppdatera innehav ────────────────────────────────────────────────
@@ -577,7 +586,7 @@ def main():
     page = st.sidebar.radio(
         "Meny",
         ["➕ Lägg till bolag","📦 Portföljöversikt","🔄 Uppdatera innehav","🛒 Köp/Sälj","📊 Ranking & köpförslag","💾 Spara"],
-        index=1
+        index=0
     )
 
     if page == "➕ Lägg till bolag":
