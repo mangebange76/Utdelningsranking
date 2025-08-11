@@ -32,10 +32,16 @@ def hamta_df():
     data = sheet.get_all_records()
     return pd.DataFrame(data)
 
+# ✅ Robust sparning: bara rader med icke-tom ticker + rätt headers
 def spara_df(df: pd.DataFrame):
-    sheet = skapa_koppling()
-    sheet.clear()
-    sheet.update([df.columns.tolist()] + df.astype(str).values.tolist())
+    ws = skapa_koppling()
+    out = säkerställ_kolumner(df).copy()
+    out = out[out["Ticker"].astype(str).str.strip() != ""]
+    if out.empty:
+        st.warning("Inget att spara: inga tickers i tabellen.")
+        return
+    ws.clear()
+    ws.update([out.columns.tolist()] + out.astype(str).values.tolist(), value_input_option="USER_ENTERED")
 
 # ── Kolumnschema ────────────────────────────────────────────────────────────
 COLUMNS = [
@@ -68,7 +74,7 @@ def migrate_sheet_columns():
         spara_df(df2)
     return df2
 
-# ── FX-hjälpare (robust) ───────────────────────────────────────────────────
+# ── FX-hjälpare ────────────────────────────────────────────────────────────
 def fx_for(cur):
     if pd.isna(cur):
         return 1.0
@@ -181,37 +187,28 @@ def beräkna(df: pd.DataFrame) -> pd.DataFrame:
     d["Frekvens/år"]    = pd.to_numeric(d["Frekvens/år"], errors="coerce").fillna(0.0).astype(float).replace(0, 4)
     d["Payment-lag (dagar)"] = pd.to_numeric(d["Payment-lag (dagar)"], errors="coerce").fillna(0.0).astype(float).replace(0, 30)
 
-    # SEK-kurs
     rates = d["Valuta"].apply(fx_for).astype(float)
     d["Kurs (SEK)"] = (d["Aktuell kurs"] * rates).astype(float).round(6)
 
-    # Årsutdelning SEK
     d["Årlig utdelning (SEK)"] = (d["Antal aktier"] * d["Utdelning/år"] * rates).round(2)
 
-    # Direktavkastning (%) = Utd/år / Aktuell kurs
     d["Direktavkastning (%)"] = 0.0
     ok = (d["Aktuell kurs"] > 0) & (d["Utdelning/år"] > 0)
     d.loc[ok, "Direktavkastning (%)"] = (100.0 * d.loc[ok, "Utdelning/år"] / d.loc[ok, "Aktuell kurs"]).round(2)
 
-    # Portföljandel
     mv = (d["Antal aktier"] * d["Kurs (SEK)"]).round(2)
     tot_mv = float(mv.sum()) if mv.sum() else 1.0
     d["Portföljandel (%)"] = (100.0 * mv / tot_mv).round(2)
 
-    # Nästa utbetalning (est)
     def next_pay(ex_date_str, freq_per_year, payment_lag_days):
         ts = pd.to_datetime(ex_date_str, errors="coerce")
         if pd.isna(ts):
             return ""
         exd = ts.date()
-        try:
-            freq = int(float(freq_per_year))
-        except Exception:
-            freq = 4
-        try:
-            lag = int(float(payment_lag_days))
-        except Exception:
-            lag = 30
+        try: freq = int(float(freq_per_year))
+        except: freq = 4
+        try: lag = int(float(payment_lag_days))
+        except: lag = 30
         freq = max(freq, 1)
         step_days = max(1, int(round(365.0 / freq)))
         today_d = date.today()
@@ -331,6 +328,16 @@ def page_add_company(df: pd.DataFrame) -> pd.DataFrame:
     st.divider()
     st.caption("Förhandsgranskning")
     st.dataframe(beräkna(df)[["Ticker","Bolagsnamn","Valuta","Antal aktier","GAV","Utdelning/år","Kurs (SEK)","Årlig utdelning (SEK)"]], use_container_width=True)
+
+    # ✅ Direkt-spara här om du vill
+    st.divider()
+    colS, _ = st.columns([1,1])
+    with colS:
+        if st.button("💾 Spara NU till Google Sheets"):
+            preview = beräkna(säkerställ_kolumner(df))
+            spara_df(preview)
+            st.success("Bolaget/raderna är nu sparade till Google Sheets!")
+
     return df
 
 # ── Sida: Uppdatera innehav ────────────────────────────────────────────────
@@ -492,7 +499,6 @@ def block_trading(df: pd.DataFrame) -> pd.DataFrame:
             if new_qty == 0:
                 base.at[i,"GAV"] = 0.0
 
-        # köa transaktionen (sparas först på sidan “💾 Spara”)
         if "pending_txs" not in st.session_state:
             st.session_state["pending_txs"] = []
         st.session_state["pending_txs"].append({
@@ -554,7 +560,7 @@ def page_save_now():
         save_pending_transactions()
         st.success("Data och transaktioner sparade till Google Sheets!")
 
-# ── Main med meny/router ───────────────────────────────────────────────────
+# ── Main (router/meny) ─────────────────────────────────────────────────────
 def main():
     st.title("Relative Yield – utdelningsportfölj")
 
@@ -589,7 +595,7 @@ def main():
     elif page == "💾 Spara":
         page_save_now()
 
-    # Uppdatera in-memory efter sidan
+    # Uppdatera in-memory
     st.session_state["working_df"] = base
 
 if __name__ == "__main__":
