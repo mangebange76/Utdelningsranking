@@ -775,7 +775,7 @@ def block_trading(df: pd.DataFrame) -> pd.DataFrame:
     tkr = st.selectbox("Ticker", options=tickers)
     side = st.radio("Typ", ["KÖP", "SÄLJ"], horizontal=True)
     qty  = st.number_input("Antal", min_value=1, value=10, step=1)
-    px_local = st.number_input("Pris (lokal valuta)", min_value=0.0, value=10.0
+    px_local = st.number_input("Pris (lokal valuta)", min_value=0.0, value=10.0)
 
     ccy_default = df.loc[df["Ticker"]==tkr, "Valuta"].iloc[0] if (df["Ticker"]==tkr).any() else "SEK"
     ccy = st.selectbox(
