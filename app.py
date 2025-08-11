@@ -261,20 +261,22 @@ def update_some_tickers(tickers: list) -> pd.DataFrame:
     st.success(f"Uppdaterade {len(tickers)} ticker(s) (in-memory).")
     return base
 
-# ── Sidopanel (FX + uppdatera EN) ──────────────────────────────────────────
+# ── Sidopanel (FIX: number_input så float alltid funkar) ───────────────────
 def sidopanel(df: pd.DataFrame):
     st.sidebar.header("⚙️ Inställningar")
     st.sidebar.markdown("**Växelkurser (SEK)**")
-    st.session_state["USDSEK"] = float(st.sidebar.text_input("USD/SEK", value=str(st.session_state.get("USDSEK", 10.50))))
-    st.session_state["EURSEK"] = float(st.sidebar.text_input("EUR/SEK", value=str(st.session_state.get("EURSEK", 11.50))))
-    st.session_state["CADSEK"] = float(st.sidebar.text_input("CAD/SEK", value=str(st.session_state.get("CADSEK", 7.80))))
-    st.session_state["NOKSEK"] = float(st.sidebar.text_input("NOK/SEK", value=str(st.session_state.get("NOKSEK", 1.00))))
+    USD = st.sidebar.number_input("USD/SEK", min_value=0.0, value=float(st.session_state.get("USDSEK", 10.50)), step=0.01, format="%.4f")
+    EUR = st.sidebar.number_input("EUR/SEK", min_value=0.0, value=float(st.session_state.get("EURSEK", 11.50)), step=0.01, format="%.4f")
+    CAD = st.sidebar.number_input("CAD/SEK", min_value=0.0, value=float(st.session_state.get("CADSEK", 7.80)), step=0.01, format="%.4f")
+    NOK = st.sidebar.number_input("NOK/SEK", min_value=0.0, value=float(st.session_state.get("NOKSEK", 1.00)), step=0.01, format="%.4f")
+    st.session_state["USDSEK"], st.session_state["EURSEK"], st.session_state["CADSEK"], st.session_state["NOKSEK"] = USD, EUR, CAD, NOK
+
     st.sidebar.markdown("---")
     one_ticker = st.sidebar.text_input("Uppdatera EN ticker (Yahoo)", placeholder="t.ex. EPD")
     if st.sidebar.button("🔄 Uppdatera EN"):
         st.session_state["working_df"] = add_or_update_ticker_row(one_ticker)
 
-# ── Sida: Lägg till bolag (Ticker obligatorisk, Antal & GAV får vara 0) ───
+# ── Sida: Lägg till bolag (Ticker obligatorisk, Antal & GAV kan vara 0) ───
 def page_add_company(df: pd.DataFrame) -> pd.DataFrame:
     st.subheader("➕ Lägg till bolag")
 
@@ -314,7 +316,7 @@ def page_add_company(df: pd.DataFrame) -> pd.DataFrame:
 
             base = säkerställ_kolumner(df)
 
-            # upsert rad med Antal & GAV (0 tillåtet)
+            # upsert rad (Antal & GAV kan vara 0)
             if (base["Ticker"] == tkr).any():
                 i = base.index[base["Ticker"] == tkr][0]
                 base.at[i, "Antal aktier"] = float(qty)
@@ -333,12 +335,9 @@ def page_add_company(df: pd.DataFrame) -> pd.DataFrame:
                 st.warning(f"Kunde inte hämta Yahoo-data just nu ({e}). Sparar ändå Ticker/Antal/GAV.")
 
             base = beräkna(base)
-
-            # skriv direkt till Google Sheets
             spara_df(base)
             st.session_state["working_df"] = base
             st.success(f"{tkr} sparad till Google Sheets.")
-
             return base
 
     st.divider()
