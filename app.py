@@ -43,6 +43,22 @@ def spara_df(df: pd.DataFrame):
     ws.clear()
     ws.update([out.columns.tolist()] + out.astype(str).values.tolist(), value_input_option="USER_ENTERED")
 
+# Hjälpare: skapa/uppdatera valfri flik (används för prognos-export)
+def ensure_or_create_ws(title: str, headers: list[str] | None = None):
+    sh = client.open_by_url(SHEET_URL)
+    try:
+        ws = sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows=1000, cols=50)
+        if headers:
+            ws.update([headers])
+    return ws
+
+def save_df_to_sheet(df: pd.DataFrame, title: str):
+    ws = ensure_or_create_ws(title, headers=df.columns.tolist())
+    ws.clear()
+    ws.update([df.columns.tolist()] + df.astype(str).values.tolist(), value_input_option="USER_ENTERED")
+
 # ── Kolumnschema ────────────────────────────────────────────────────────────
 COLUMNS = [
     "Ticker", "Bolagsnamn", "Aktuell kurs", "Valuta", "Direktavkastning (%)", "Utdelning/år",
@@ -80,10 +96,10 @@ def fx_for(cur):
         return 1.0
     c = str(cur).strip().upper()
     rate_map = {
-        "USD": st.session_state.get("USDSEK", 10.50),
-        "EUR": st.session_state.get("EURSEK", 11.50),
-        "CAD": st.session_state.get("CADSEK", 7.80),
-        "NOK": st.session_state.get("NOKSEK", 1.00),
+        "USD": st.session_state.get("USDSEK", 9.60),
+        "EUR": st.session_state.get("EURSEK", 11.10),
+        "CAD": st.session_state.get("CADSEK", 6.95),
+        "NOK": st.session_state.get("NOKSEK", 0.94),
         "SEK": 1.0,
     }
     try:
@@ -222,54 +238,92 @@ def beräkna(df: pd.DataFrame) -> pd.DataFrame:
     ]
     return d
 
-# ── Lägg till/uppdatera EN (in-memory) ─────────────────────────────────────
-def add_or_update_ticker_row(ticker: str) -> pd.DataFrame:
-    base = säkerställ_kolumner(st.session_state["working_df"])
-    ticker = (ticker or "").strip().upper()
-    if not ticker:
-        st.warning("Ange en ticker.")
-        return base
-    if not (base["Ticker"] == ticker).any():
-        base = pd.concat([base, pd.DataFrame([{"Ticker": ticker, "Antal aktier": 0.0, "GAV": 0.0}])], ignore_index=True)
-    try:
-        vals = hamta_yahoo(ticker)
-        for k, v in vals.items():
-            base.loc[base["Ticker"] == ticker, k] = v
-        base = beräkna(base)
-        st.success(f"Ticker {ticker} uppdaterad (in-memory).")
-    except Exception as e:
-        st.error(f"Kunde inte hämta {ticker}: {e}")
-    return base
+# ── Prognos (12/24/36 mån) ─────────────────────────────────────────────────
+def _gen_payment_dates(first_ex_date: str, freq_per_year: float, payment_lag_days: float, months_ahead: int = 12):
+    """Generera kommande betalningsdatum (date-objekt) upp till X månader framåt."""
+    ts = pd.to_datetime(first_ex_date, errors="coerce")
+    if pd.isna(ts):
+        return []
+    exd = ts.date()
 
-# ── Uppdatera FLERA/ALLA (1 s paus, in-memory) ─────────────────────────────
-def update_some_tickers(tickers: list) -> pd.DataFrame:
-    base = säkerställ_kolumner(st.session_state["working_df"])
-    if not tickers:
-        st.warning("Välj minst en ticker.")
-        return base
-    bar = st.progress(0.0)
-    for i, tkr in enumerate(tickers, 1):
+    try: freq = int(float(freq_per_year))
+    except: freq = 4
+    freq = max(freq, 1)
+
+    try: lag = int(float(payment_lag_days))
+    except: lag = 30
+    lag = max(lag, 0)
+
+    step_days = max(1, int(round(365.0 / freq)))
+    today_d = date.today()
+    horizon = today_d + timedelta(days=int(round(months_ahead * 30.44)))
+
+    # Rulla fram ex-datum till framtiden
+    while exd < today_d:
+        exd = exd + timedelta(days=step_days)
+
+    dates = []
+    pay = exd + timedelta(days=lag)
+    while pay <= horizon:
+        dates.append(pay)
+        exd = exd + timedelta(days=step_days)
+        pay = exd + timedelta(days=lag)
+    return dates
+
+def prognos_kalender(df: pd.DataFrame, months_ahead: int = 12):
+    """Returnerar (monthly, cal): månadsvis och detalj-prognos i SEK."""
+    d = beräkna(df).copy()
+    if d.empty:
+        return pd.DataFrame(columns=["Månad","Utdelning (SEK)"]), pd.DataFrame()
+
+    rows = []
+    for _, r in d.iterrows():
         try:
-            vals = hamta_yahoo(tkr)
-            for k, v in vals.items():
-                base.loc[base["Ticker"] == tkr, k] = v
-        except Exception as e:
-            st.warning(f"{tkr}: misslyckades ({e})")
-        time.sleep(1.0)
-        bar.progress(i/len(tickers))
-    base = beräkna(base)
-    st.success(f"Uppdaterade {len(tickers)} ticker(s) (in-memory).")
-    return base
+            per_share_local = float(r.get("Utdelning/år", 0.0)) / max(1.0, float(r.get("Frekvens/år", 4.0)))
+            qty = float(r.get("Antal aktier", 0.0))
+            fx = fx_for(r.get("Valuta", "SEK"))
+            per_payment_sek = per_share_local * fx * qty
+            if per_payment_sek <= 0:
+                continue
+            pays = _gen_payment_dates(r.get("Ex-Date",""), r.get("Frekvens/år",4), r.get("Payment-lag (dagar)",30), months_ahead)
+            for p in pays:
+                rows.append({"Datum": p, "Ticker": r["Ticker"], "Belopp (SEK)": round(per_payment_sek, 2)})
+        except Exception:
+            continue
 
-# ── Sidopanel (FIX: number_input så float alltid funkar) ───────────────────
+    if not rows:
+        return pd.DataFrame(columns=["Månad","Utdelning (SEK)"]), pd.DataFrame()
+
+    cal = pd.DataFrame(rows)
+    cal["Månad"] = cal["Datum"].apply(lambda d: f"{d.year}-{str(d.month).zfill(2)}")
+    monthly = cal.groupby("Månad", as_index=False)["Belopp (SEK)"].sum().rename(columns={"Belopp (SEK)":"Utdelning (SEK)"})
+    monthly = monthly.sort_values("Månad")
+    return monthly, cal
+
+# ── Sidopanel (number_input + reset av FX) ─────────────────────────────────
 def sidopanel(df: pd.DataFrame):
     st.sidebar.header("⚙️ Inställningar")
     st.sidebar.markdown("**Växelkurser (SEK)**")
-    USD = st.sidebar.number_input("USD/SEK", min_value=0.0, value=float(st.session_state.get("USDSEK", 10.50)), step=0.01, format="%.4f")
-    EUR = st.sidebar.number_input("EUR/SEK", min_value=0.0, value=float(st.session_state.get("EURSEK", 11.50)), step=0.01, format="%.4f")
-    CAD = st.sidebar.number_input("CAD/SEK", min_value=0.0, value=float(st.session_state.get("CADSEK", 7.80)), step=0.01, format="%.4f")
-    NOK = st.sidebar.number_input("NOK/SEK", min_value=0.0, value=float(st.session_state.get("NOKSEK", 1.00)), step=0.01, format="%.4f")
+
+    # DINA standardvärden
+    DEF = {"USDSEK": 9.60, "EURSEK": 11.10, "CADSEK": 6.95, "NOKSEK": 0.94}
+    for k, v in DEF.items():
+        st.session_state.setdefault(k, v)
+
+    colA, colB = st.sidebar.columns(2)
+    with colA:
+        USD = st.number_input("USD/SEK", min_value=0.0, value=float(st.session_state["USDSEK"]), step=0.01, format="%.4f")
+        EUR = st.number_input("EUR/SEK", min_value=0.0, value=float(st.session_state["EURSEK"]), step=0.01, format="%.4f")
+    with colB:
+        CAD = st.number_input("CAD/SEK", min_value=0.0, value=float(st.session_state["CADSEK"]), step=0.01, format="%.4f")
+        NOK = st.number_input("NOK/SEK", min_value=0.0, value=float(st.session_state["NOKSEK"]), step=0.01, format="%.4f")
+
     st.session_state["USDSEK"], st.session_state["EURSEK"], st.session_state["CADSEK"], st.session_state["NOKSEK"] = USD, EUR, CAD, NOK
+
+    if st.sidebar.button("↩︎ Återställ FX till standard"):
+        for k, v in DEF.items():
+            st.session_state[k] = v
+        st.experimental_rerun()
 
     st.sidebar.markdown("---")
     one_ticker = st.sidebar.text_input("Uppdatera EN ticker (Yahoo)", placeholder="t.ex. EPD")
@@ -568,6 +622,38 @@ def page_save_now():
         save_pending_transactions()
         st.success("Data och transaktioner sparade till Google Sheets!")
 
+# ── Sida: Utdelningskalender ───────────────────────────────────────────────
+def page_calendar(df: pd.DataFrame):
+    st.subheader("📅 Utdelningskalender")
+
+    # Välj horisont: 12 / 24 / 36 månader
+    months = st.selectbox("Prognoshorisont", options=[12, 24, 36], index=0, help="Välj hur långt fram kassaflödet ska prognostiseras.")
+    monthly, cal = prognos_kalender(df, months_ahead=months)
+
+    if monthly.empty:
+        st.info("Ingen prognos ännu – saknar Ex-Date/frekvens/utdelningsdata.")
+        return
+
+    st.write(f"**Månadsvis prognos ({months} mån) i SEK:**")
+    st.dataframe(monthly, use_container_width=True)
+    st.bar_chart(monthly.set_index("Månad")["Utdelning (SEK)"])
+
+    if not cal.empty:
+        with st.expander("Detaljerade kommande betalningar per ticker"):
+            st.dataframe(cal.sort_values("Datum"), use_container_width=True)
+
+    st.divider()
+    if st.button("💾 Spara prognos till Google Sheets"):
+        try:
+            save_df_to_sheet(monthly, "Prognos_Månad")
+            if not cal.empty:
+                cal_sorted = cal.sort_values("Datum").copy()
+                cal_sorted["Datum"] = cal_sorted["Datum"].apply(lambda d: d.strftime("%Y-%m-%d"))
+                save_df_to_sheet(cal_sorted, "Prognos_Detalj")
+            st.success("Prognosen sparad till arken 'Prognos_Månad' och 'Prognos_Detalj'.")
+        except Exception as e:
+            st.error(f"Kunde inte spara prognosen: {e}")
+
 # ── Main (router/meny) ─────────────────────────────────────────────────────
 def main():
     st.title("Relative Yield – utdelningsportfölj")
@@ -584,7 +670,7 @@ def main():
     st.sidebar.markdown("---")
     page = st.sidebar.radio(
         "Meny",
-        ["➕ Lägg till bolag","📦 Portföljöversikt","🔄 Uppdatera innehav","🛒 Köp/Sälj","📊 Ranking & köpförslag","💾 Spara"],
+        ["➕ Lägg till bolag","📦 Portföljöversikt","🔄 Uppdatera innehav","🛒 Köp/Sälj","📊 Ranking & köpförslag","📅 Utdelningskalender","💾 Spara"],
         index=0
     )
 
@@ -600,6 +686,8 @@ def main():
         block_top_card(base)
         st.divider()
         block_ranking(base)
+    elif page == "📅 Utdelningskalender":
+        page_calendar(base)
     elif page == "💾 Spara":
         page_save_now()
 
