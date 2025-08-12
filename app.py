@@ -187,6 +187,18 @@ def spara_data(df: pd.DataFrame):
     except Exception as e:
         st.error("❌ Fel vid sparande."); st.caption(e)
 
+# ── RESET (in‑memory)
+def reset_in_memory():
+    """Återställ appens in-memory-data till det som ligger i Google Sheets."""
+    try:
+        fresh = migrate_sheet_columns()
+        st.session_state["working_df"] = säkerställ_kolumner(fresh)
+    except Exception:
+        st.session_state["working_df"] = säkerställ_kolumner(pd.DataFrame())
+    for k in ["pending_txs", "last_yahoo_vals"]:
+        if k in st.session_state:
+            st.session_state.pop(k)
+
 # ── SETTINGS (målvikter) i egen flik
 SETTINGS_SHEET = "Settings"
 DEFAULT_TARGETS = {
@@ -622,6 +634,44 @@ def page_mass_update(df: pd.DataFrame) -> pd.DataFrame:
         st.success("Klart! Glöm inte att spara till Google Sheets om du vill skriva tillbaka.")
     return st.session_state.get("working_df", d)
 
+# ── Enkel portföljvy
+def portfolj_oversikt(df: pd.DataFrame) -> pd.DataFrame:
+    st.subheader("📦 Portföljöversikt")
+    d = beräkna(df).copy()
+    d["Insatt (SEK)"] = (pd.to_numeric(d["Antal aktier"], errors="coerce").fillna(0.0) * pd.to_numeric(d["GAV"], errors="coerce").fillna(0.0)).round(2)
+    d["Orealiserad P/L (SEK)"] = (d["Marknadsvärde (SEK)"] - d["Insatt (SEK)"]).round(2)
+    tot_mv, tot_ins = float(d["Marknadsvärde (SEK)"].sum()), float(d["Insatt (SEK)"].sum())
+    tot_pl, tot_div = float(d["Orealiserad P/L (SEK)"].sum()), float(d["Årlig utdelning (SEK)"].sum())
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Portföljvärde", f"{round(tot_mv,2):,}".replace(",", " "))
+    c2.metric("Insatt kapital", f"{round(tot_ins,2):,}".replace(",", " "))
+    c3.metric("Orealiserad P/L", f"{round(tot_pl,2):,}".replace(",", " "))
+    c4.metric("Årsutdelning", f"{round(tot_div,2):,}".replace(",", " "))
+    st.dataframe(d[["Ticker","Bolagsnamn","Valuta","Kategori","Antal aktier","GAV","Kurs (SEK)","Marknadsvärde (SEK)","Direktavkastning (%)","Årlig utdelning (SEK)","Ex-Date","Nästa utbetalning (est)"]], use_container_width=True)
+    return d
+
+# ── Settings-sida (mål)
+def page_settings_distribution(df: pd.DataFrame):
+    st.subheader("⚖️ Mål & fördelning per kategori")
+    targets, ignore_empty = load_settings()
+    cur = {cat: float(targets.get(cat, 0.0)) for cat in CATEGORY_CHOICES}
+    edits = {}
+    cols = st.columns(3)
+    for i, cat in enumerate(CATEGORY_CHOICES):
+        with cols[i % 3]:
+            edits[cat] = st.number_input(f"{cat}", min_value=0.0, max_value=100.0,
+                                         value=float(cur.get(cat, 0.0)), step=1.0, key=f"tgt_{cat}")
+    st.markdown("---")
+    c1, c2, c3 = st.columns([1,1,2])
+    with c1:
+        ignore = st.checkbox("Ignorera kategorier utan ägda aktier", value=ignore_empty)
+    with c2:
+        if st.button("💾 Spara mål till Google Sheets"):
+            save_settings(edits, ignore); st.success("Mål & flagga sparade.")
+    with c3:
+        total = sum(edits.values())
+        st.metric("Summa angivna mål (%)", f"{total:.1f}")
+
 # ── Avgifter (mini)
 MIN_COURTAGE_RATE = 0.0025
 MIN_COURTAGE_SEK  = 1.0
@@ -747,28 +797,73 @@ def suggest_buys(df: pd.DataFrame, cash_sek: float, w_val: float=0.5, w_cat: flo
     cols = ["Ticker","Kategori","Poäng","DA %","Vikt %","Nästa utb","Föreslagna st","Kostnad ca","Motivering"]
     return pd.DataFrame(rows)[cols] if rows else pd.DataFrame(columns=cols)
 
-# ── Sidor
-def page_settings_distribution(df: pd.DataFrame):
-    st.subheader("⚖️ Mål & fördelning per kategori")
-    targets, ignore_empty = load_settings()
-    cur = {cat: float(targets.get(cat, 0.0)) for cat in CATEGORY_CHOICES}
-    edits = {}
-    cols = st.columns(3)
-    for i, cat in enumerate(CATEGORY_CHOICES):
-        with cols[i % 3]:
-            edits[cat] = st.number_input(f"{cat}", min_value=0.0, max_value=100.0,
-                                         value=float(cur.get(cat, 0.0)), step=1.0, key=f"tgt_{cat}")
-    st.markdown("---")
-    c1, c2, c3 = st.columns([1,1,2])
+# ── Köpförslag‑UI + “Använd köpplanen”
+def page_buy_suggestions(df: pd.DataFrame):
+    st.subheader("🎯 Köpförslag (målvikter & tak beaktas)")
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        ignore = st.checkbox("Ignorera kategorier utan ägda aktier", value=ignore_empty)
+        cash = st.number_input("Tillgänglig kassa (SEK)", min_value=0.0, value=500.0, step=100.0)
     with c2:
-        if st.button("💾 Spara mål till Google Sheets"):
-            save_settings(edits, ignore); st.success("Mål & flagga sparade.")
+        w_val = st.slider("Vikt: Värdering (DA)", 0.0, 1.0, 0.50, 0.05)
     with c3:
-        total = sum(edits.values())
-        st.metric("Summa angivna mål (%)", f"{total:.1f}")
+        w_cat = st.slider("Vikt: Kategori-gap vs mål", 0.0, 1.0, 0.35, 0.05)
+    with c4:
+        w_time = st.slider("Vikt: Timing (nära utdelning)", 0.0, 1.0, 0.15, 0.05)
 
+    if st.button("Beräkna köpförslag"):
+        sug = suggest_buys(df, cash_sek=cash, w_val=w_val, w_cat=w_cat, w_time=w_time, topk=5)
+        if sug.empty:
+            st.info("Inga köpförslag som klarar reglerna just nu.")
+        else:
+            st.dataframe(sug, use_container_width=True)
+            st.caption("Poäng = DA + kategori-gap + hur nära nästa utdelning.")
+
+            # ——— Använd köpplanen direkt (in‑memory) ———
+            apply_now = st.checkbox("Använd köpplanen direkt (in‑memory)")
+            if apply_now and st.button("🚀 Genomför föreslagna köp i minnet"):
+                base = säkerställ_kolumner(st.session_state.get("working_df", df)).copy()
+                if "pending_txs" not in st.session_state:
+                    st.session_state["pending_txs"] = []
+                for _, row in sug.iterrows():
+                    tkr = str(row["Ticker"])
+                    n   = int(row["Föreslagna st"])
+                    if n <= 0: 
+                        continue
+                    m = base["Ticker"].astype(str) == tkr
+                    if not m.any():
+                        st.warning(f"{tkr} finns inte i tabellen – hoppar över.")
+                        continue
+
+                    px_local = float(pd.to_numeric(base.loc[m, "Aktuell kurs"], errors="coerce").fillna(0.0).iloc[0])
+                    ccy      = str(base.loc[m, "Valuta"].iloc[0]).upper() or "SEK"
+                    fx       = fx_for(ccy)
+                    px_sek   = round(px_local * fx, 6)
+                    gross    = round(px_sek * n, 2)
+                    foreign  = (ccy != "SEK")
+                    fee_c, fee_fx, fee_tot = calc_fees(gross, foreign)
+                    cost_sek = gross + fee_tot
+
+                    old_qty = float(pd.to_numeric(base.loc[m, "Antal aktier"], errors="coerce").fillna(0.0).iloc[0])
+                    old_gav = float(pd.to_numeric(base.loc[m, "GAV"], errors="coerce").fillna(0.0).iloc[0])
+                    new_qty = old_qty + n
+                    new_gav = 0.0 if new_qty == 0 else round(((old_gav * old_qty) + cost_sek) / new_qty, 6)
+                    base.loc[m, "Antal aktier"] = new_qty
+                    base.loc[m, "GAV"] = new_gav
+
+                    st.session_state["pending_txs"].append({
+                        "Tid": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "Typ": "KÖP", "Ticker": tkr, "Antal": n,
+                        "Pris (lokal)": float(px_local), "Valuta": ccy, "FX": float(fx),
+                        "Pris (SEK)": float(px_sek), "Belopp (SEK)": float(gross),
+                        "Courtage (SEK)": float(fee_c), "FX-avgift (SEK)": float(fee_fx),
+                        "Tot.avgifter (SEK)": float(fee_tot), "Kommentar": "auto från köpförslag"
+                    })
+
+                st.session_state["working_df"] = beräkna(base)
+                st.success("Köpplanen är inlagd i minnet. Gå till “💾 Spara” om du vill skriva till Google Sheets.")
+                _rerun()
+
+# ── Kalender-sida
 def page_calendar(df: pd.DataFrame):
     st.subheader("📅 Utdelningskalender")
     months = st.selectbox("Prognoshorisont", options=[12, 24, 36], index=0)
@@ -782,15 +877,31 @@ def page_calendar(df: pd.DataFrame):
         with st.expander("Detaljerade kommande betalningar per ticker"):
             st.dataframe(cal.sort_values("Datum"), use_container_width=True)
 
+# ── Spara-sida
 def page_save_now(df: pd.DataFrame):
     st.subheader("💾 Spara till Google Sheets")
     preview = beräkna( säkerställ_kolumner(df) )
     st.write("Antal rader som sparas:", len(preview))
     st.dataframe(preview[["Ticker","Bolagsnamn","Valuta","Kategori","Antal aktier","GAV","Aktuell kurs","Utdelning/år","Kurs (SEK)","Årlig utdelning (SEK)"]], use_container_width=True)
+
+    with st.expander("In‑memory kontroll"):
+        c1, c2 = st.columns([1,2])
+        with c1:
+            clear_ok2 = st.checkbox("Bekräfta rensning här också")
+        with c2:
+            if st.button("🧹 Rensa in‑memory och ladda från Sheets"):
+                if clear_ok2:
+                    reset_in_memory()
+                    st.success("In‑memory rensat. Återläst från Google Sheets.")
+                    _rerun()
+                else:
+                    st.warning("Bocka i bekräftelsen först.")
+
     if st.button("✅ Bekräfta och spara"):
         if preview["Ticker"].astype(str).str.strip().eq("").all():
             st.error("Inget att spara: inga tickers."); return df
-        spara_data(preview); st.success("Data sparad!")
+        spara_data(preview)
+        st.success("Data sparad!")
     return preview
 
 # ── Sidopanel
@@ -831,42 +942,15 @@ def sidopanel():
             st.session_state["working_df"] = page_update_single(base)
             st.sidebar.success(f"{one} uppdaterad (in‑memory).")
 
-# ── Enkel portföljvy
-def portfolj_oversikt(df: pd.DataFrame) -> pd.DataFrame:
-    st.subheader("📦 Portföljöversikt")
-    d = beräkna(df).copy()
-    d["Insatt (SEK)"] = (pd.to_numeric(d["Antal aktier"], errors="coerce").fillna(0.0) * pd.to_numeric(d["GAV"], errors="coerce").fillna(0.0)).round(2)
-    d["Orealiserad P/L (SEK)"] = (d["Marknadsvärde (SEK)"] - d["Insatt (SEK)"]).round(2)
-    tot_mv, tot_ins = float(d["Marknadsvärde (SEK)"].sum()), float(d["Insatt (SEK)"].sum())
-    tot_pl, tot_div = float(d["Orealiserad P/L (SEK)"].sum()), float(d["Årlig utdelning (SEK)"].sum())
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Portföljvärde", f"{round(tot_mv,2):,}".replace(",", " "))
-    c2.metric("Insatt kapital", f"{round(tot_ins,2):,}".replace(",", " "))
-    c3.metric("Orealiserad P/L", f"{round(tot_pl,2):,}".replace(",", " "))
-    c4.metric("Årsutdelning", f"{round(tot_div,2):,}".replace(",", " "))
-    st.dataframe(d[["Ticker","Bolagsnamn","Valuta","Kategori","Antal aktier","GAV","Kurs (SEK)","Marknadsvärde (SEK)","Direktavkastning (%)","Årlig utdelning (SEK)","Ex-Date","Nästa utbetalning (est)"]], use_container_width=True)
-    return d
-
-# ── Köpförslag-UI
-def page_buy_suggestions(df: pd.DataFrame):
-    st.subheader("🎯 Köpförslag (målvikter & tak beaktas)")
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        cash = st.number_input("Tillgänglig kassa (SEK)", min_value=0.0, value=500.0, step=100.0)
-    with c2:
-        w_val = st.slider("Vikt: Värdering (DA)", 0.0, 1.0, 0.50, 0.05)
-    with c3:
-        w_cat = st.slider("Vikt: Kategori-gap vs mål", 0.0, 1.0, 0.35, 0.05)
-    with c4:
-        w_time = st.slider("Vikt: Timing (nära utdelning)", 0.0, 1.0, 0.15, 0.05)
-
-    if st.button("Beräkna köpförslag"):
-        sug = suggest_buys(df, cash_sek=cash, w_val=w_val, w_cat=w_cat, w_time=w_time, topk=5)
-        if sug.empty:
-            st.info("Inga köpförslag som klarar reglerna just nu.")
+    st.sidebar.markdown("---")
+    clear_ok = st.sidebar.checkbox("Bekräfta rensning (återställ till Google Sheets)")
+    if st.sidebar.button("🧹 Rensa ändringar (in‑memory)"):
+        if clear_ok:
+            reset_in_memory()
+            st.sidebar.success("In‑memory ändringar rensade. Data återställd från Google Sheets.")
+            _rerun()
         else:
-            st.dataframe(sug, use_container_width=True)
-            st.caption("Poäng = DA + kategori-gap + hur nära nästa utdelning.")
+            st.sidebar.warning("Bocka i bekräftelsen först.")
 
 # ── Main
 def main():
