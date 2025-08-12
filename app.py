@@ -39,6 +39,35 @@ COLUMNS = [
     "Senaste uppdatering", "Källa", "Marknadsvärde (SEK)"
 ]
 
+# ── Robust numerik-parser (fixar t.ex. 123:36:00 & 123.36.00) ───────────────
+def _coerce_decimal(val) -> float:
+    if pd.isna(val):
+        return 0.0
+    s = str(val).strip()
+    if not s:
+        return 0.0
+    s = s.replace(" ", "").replace("−", "-")
+    if ":" in s:
+        s = s.replace(":", ".")
+    s = "".join(ch for ch in s if ch.isdigit() or ch in ",.-")
+    if not s:
+        return 0.0
+    if "," in s and "." in s:
+        last = max(s.rfind(","), s.rfind("."))
+        int_part = "".join(c for c in s[:last] if c.isdigit() or c == "-")
+        frac_part = "".join(c for c in s[last+1:] if c.isdigit())
+        norm = f"{int_part}.{frac_part}" if int_part not in ("", "-") else f"0.{frac_part}"
+    else:
+        norm = s.replace(",", ".")
+        if norm.count(".") > 1:
+            parts = norm.split(".")
+            norm = "".join(parts[:-1]) + "." + parts[-1]
+    try:
+        return float(norm)
+    except Exception:
+        x = pd.to_numeric(norm, errors="coerce")
+        return float(x) if pd.notna(x) else 0.0
+
 def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     if d.empty:
@@ -46,27 +75,29 @@ def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
     for c in COLUMNS:
         if c not in d.columns:
             d[c] = ""
-    # typer/defaults
+
     d["Ticker"] = d["Ticker"].astype(str).str.strip().str.upper()
     d["Bolagsnamn"] = d["Bolagsnamn"].astype(str)
     d["Valuta"] = d["Valuta"].astype(str).str.strip().str.upper()
     d["Kategori"] = d["Kategori"].astype(str).replace({"": "QUALITY"})
-    # numeriska
-    num_cols = ["Aktuell kurs","Utdelning/år","Utdelning/år (manuell)","Frekvens/år",
-                "Payment-lag (dagar)","Antal aktier","GAV","Marknadsvärde (SEK)"]
-    for c in num_cols:
+
+    # vanliga numeriska
+    for c in ["Aktuell kurs","Utdelning/år","Utdelning/år (manuell)",
+              "Frekvens/år","Payment-lag (dagar)","Antal aktier","Marknadsvärde (SEK)"]:
         d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
-    # bool
+    # GAV med super-robust parser
+    d["GAV"] = d["GAV"].apply(_coerce_decimal).fillna(0.0)
+
     if "Lås utdelning" in d.columns:
         d["Lås utdelning"] = d["Lås utdelning"].apply(lambda x: bool(x) if pd.notna(x) else False)
     else:
         d["Lås utdelning"] = False
+
     for add in ["Frekvenskälla","Utdelningskälla","Senaste uppdatering","Källa",
                 "Utdelningsfrekvens","Ex-Date","Nästa utbetalning (est)"]:
         if add not in d.columns:
             d[add] = ""
-    if "Utdelningskälla" not in d.columns:
-        d["Utdelningskälla"] = "Yahoo"
+
     return d[COLUMNS].copy()
 
 # ── Kategorier & max-tak ───────────────────────────────────────────────────
@@ -77,7 +108,7 @@ MAX_CAT = {
     "Finance": 20.0, "Other": 10.0,
 }
 CATEGORY_CHOICES = list(MAX_CAT.keys())
-GLOBAL_MAX_NAME = 12.0  # max-vikt per enskilt bolag i %
+GLOBAL_MAX_NAME = 12.0
 
 def get_cat_max(cat: str) -> float:
     return float(MAX_CAT.get(str(cat or "").strip() or "QUALITY", 100.0))
@@ -101,13 +132,13 @@ def fx_for(cur: str) -> float:
     }
     return float(m.get(c, 1.0))
 
-# ── Google Sheets helpers (READ‑ONLY för läsning) ──────────────────────────
+# ── Google Sheets helpers ───────────────────────────────────────────────────
 def _open_sheet():
     try:
         sh = client.open_by_url(SHEET_URL)
         return sh
     except Exception as e:
-        st.error("❌ Kunde inte öppna kalkylbladet. Kontrollera SHEET_URL och behörigheter.")
+        st.error("❌ Kunde inte öppna kalkylbladet. Kontrollera SHEET_URL/behörighet.")
         st.caption(f"Tekniskt fel: {e}")
         return None
 
@@ -115,12 +146,11 @@ def _ensure_worksheet(sh, title="Bolag"):
     if sh is None:
         return None
     try:
-        ws = sh.worksheet(title)
-        return ws
+        return sh.worksheet(title)
     except gspread.WorksheetNotFound:
         try:
             ws = sh.add_worksheet(title=title, rows=2000, cols=len(COLUMNS)+5)
-            ws.update([COLUMNS])  # skriv header
+            ws.update([COLUMNS])
             return ws
         except Exception as e:
             st.error("❌ Kunde inte skapa fliken 'Bolag'.")
@@ -129,11 +159,9 @@ def _ensure_worksheet(sh, title="Bolag"):
 
 def skapa_koppling():
     sh = _open_sheet()
-    ws = _ensure_worksheet(sh, title=SHEET_NAME)
-    return ws
+    return _ensure_worksheet(sh, title=SHEET_NAME)
 
 def hamta_data():
-    """READ‑ONLY: hämtar alla rader utan att skriva något tillbaka."""
     ws = skapa_koppling()
     if ws is None:
         return pd.DataFrame(columns=COLUMNS)
@@ -151,13 +179,9 @@ def hamta_data():
         return pd.DataFrame(columns=COLUMNS)
 
 def migrate_sheet_columns():
-    """READ‑ONLY: mappa mjukt till COLUMNS i minnet; skriv aldrig till Sheets här."""
-    df = hamta_data()
-    return säkerställ_kolumner(df)
+    return säkerställ_kolumner(hamta_data())
 
-# ── Backup‑städning (>7 dagar) och spara (enda stället som skriver) ───────
 def cleanup_old_backups(days: int = 7):
-    """Tar bort flikar Backup_YYYYMMDD_HHMMSS äldre än 'days' dagar."""
     try:
         sh = client.open_by_url(SHEET_URL)
         cutoff = datetime.now() - timedelta(days=days)
@@ -190,22 +214,17 @@ def spara_data(df: pd.DataFrame):
         sh = client.open_by_url(SHEET_URL)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         bkp_title = f"Backup_{ts}"
-
-        # 1) Backup till ny flik
         try:
             ws_b = sh.add_worksheet(title=bkp_title, rows=max(2000, len(d)+5), cols=len(COLUMNS)+5)
             ws_b.update([d.columns.tolist()] + d.astype(str).values.tolist(), value_input_option="USER_ENTERED")
         except Exception as e:
             st.warning(f"Backup misslyckades: {e}")
 
-        # 2) Skriv till huvudfliken
         ws.clear()
         ws.update([d.columns.tolist()] + d.astype(str).values.tolist(), value_input_option="USER_ENTERED")
 
-        # 3) Städning av gamla backupflikar
         cleanup_old_backups(days=7)
-
-        st.success(f"✅ Sparade {len(d)} rader. (Backup: {bkp_title}, äldre än 7 dagar rensade)")
+        st.success(f"✅ Sparade {len(d)} rader. (Backup: {bkp_title})")
     except Exception as e:
         st.error("❌ Fel vid sparande till Google Sheets.")
         st.caption(f"Tekniskt fel: {e}")
@@ -266,6 +285,7 @@ def hamta_yahoo_data(ticker: str):
             except Exception:
                 info = {}
 
+        # Pris
         price = None
         try:
             price = t.fast_info.get("last_price")
@@ -290,10 +310,11 @@ def hamta_yahoo_data(ticker: str):
             except Exception:
                 currency = "SEK"
 
+        # Utdelning & frekvens via historik
         div_rate = 0.0
         freq = 0
         freq_text = "Oregelbunden"
-        freq_src = "Ingen historik"
+        freq_src  = "Ingen historik"
         ex_date_str = ""
         try:
             divs = t.dividends
@@ -307,6 +328,7 @@ def hamta_yahoo_data(ticker: str):
         except Exception:
             pass
 
+        # Fallbacks
         if div_rate == 0.0:
             try:
                 fwd = info.get("forwardAnnualDividendRate")
@@ -403,8 +425,6 @@ def refresh_all_from_yahoo(df: pd.DataFrame, sleep_s: float = 1.0, show_progress
 
     if show_progress:
         prog.progress(100)
-        msg.text("Klart. Räknar om…")
-
     return beräkna(d)
 
 # ── Full beräkning ─────────────────────────────────────────────────────────
@@ -563,7 +583,6 @@ def suggest_buys(df: pd.DataFrame,
                 diag.append({"Ticker": tkr, "Skäl": f"1 st skulle överskrida kategori‑tak {MAX_CAT.get(cat,100):.1f}%"})
                 continue
 
-        # beräkna max kapacitet enligt regler
         T = float(d["Marknadsvärde (SEK)"].sum())
         if T <= 0:
             n_name_cap = 10**9
@@ -826,6 +845,7 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame) -> pd.DataFrame:
                     "Utdelning/år": float(vals.get("utdelning") or 0.0),
                     "Frekvens/år": int(vals.get("frekvens") or 0),
                     "Utdelningsfrekvens": vals.get("frekvens_text",""),
+                    "Frekvenskälla": vals.get("frekvens_källa",""),
                     "Ex-Date": vals.get("ex_date",""),
                     "Källa": "Yahoo", "Senaste uppdatering": vals.get("uppdaterad","")
                 })
@@ -999,7 +1019,7 @@ def page_buy_suggestions(df: pd.DataFrame):
         w_time = st.slider("Vikt: Timing (nära utdelning)", 0.0, 1.0, 0.15, 0.05)
     with c4:
         allow_margin = st.number_input("Marginal över 12%-tak (p)", min_value=0.0, value=0.0, step=0.1,
-                                       help="Tillåten buffert i procentenheter över tak vid prövning av 1 st")
+                                       help="Buffert i procentenheter vid 1‑aktie‑prövning")
 
     if st.button("Beräkna köpförslag"):
         sug, diag = suggest_buys(
