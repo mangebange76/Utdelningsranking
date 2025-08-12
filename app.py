@@ -269,29 +269,75 @@ def save_settings(global_max, cat_targets: dict):
 
 # ── Yahoo Finance-hämtning ────────────────────────────────────────────────
 def fetch_yahoo(ticker: str) -> dict:
+    """
+    Hämtar centrala fält för ett bolag:
+    - Aktuell kurs (lokal)
+    - Valuta
+    - Bolagsnamn
+    - Utdelning/år (summa av sista 12 mån utdelningar)
+    - Frekvens/år (antal utdelningar sista 12 mån)
+    - Ex-Date (senaste i historiken)
+    - Källa
+    """
     try:
         _throttle(1.0)
-        t = ticker.strip().upper()
-        yf_ticker = yf.Ticker(t)
-        info = yf_ticker.info if hasattr(yf_ticker, "info") else {}
-        hist_divs = getattr(yf_ticker, "dividends", pd.Series(dtype=float))
+        t = (ticker or "").strip().upper()
+        if not t:
+            return {}
 
-        ex_date = None
-        if hist_divs is not None and not hist_divs.empty:
-            ex_date = hist_divs.index[-1].strftime("%Y-%m-%d")
+        yf_t = yf.Ticker(t)
 
-        # Summera senaste 12 mån utdelningar
+        # Info-block med flera fallbacks
+        info = {}
+        try:
+            info = yf_t.get_info() or {}
+        except Exception:
+            try:
+                info = yf_t.info or {}
+            except Exception:
+                info = {}
+
+        # Kurs i lokal valuta – flera källor
+        price = None
+        try:
+            price = getattr(yf_t, "fast_info", {}).get("last_price", None)
+        except Exception:
+            price = None
+        if price in (None, ""):
+            price = info.get("currentPrice") or info.get("regularMarketPrice")
+        if price in (None, ""):
+            try:
+                h = yf_t.history(period="5d")
+                if not h.empty:
+                    price = float(h["Close"].iloc[-1])
+            except Exception:
+                price = None
+        price = _to_float(price)
+
+        # Valuta
+        currency = (info.get("currency") or "").upper() or "SEK"
+        # Namn
+        name = info.get("shortName") or info.get("longName") or t
+
+        # Utdelningshistorik → 12m-summa & frekvens
         div_year = 0.0
         freq = 0
-        if hist_divs is not None and not hist_divs.empty:
-            last12 = hist_divs[hist_divs.index >= (pd.Timestamp.utcnow() - pd.Timedelta(days=365))]
-            div_year = float((last12.tail(12)).sum())
-            freq = int(last12.shape[0])
+        ex_date = ""
+        try:
+            divs = yf_t.dividends
+            if divs is not None and not divs.empty:
+                cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=365)
+                last12 = divs[divs.index >= cutoff]
+                div_year = float(last12.tail(12).sum()) if not last12.empty else 0.0
+                freq = int(last12.shape[0]) if not last12.empty else 0
+                ex_date = pd.to_datetime(divs.index.max()).strftime("%Y-%m-%d")
+        except Exception:
+            pass
 
         return {
-            "Aktuell kurs": _to_float(info.get("currentPrice", 0)),
-            "Valuta": info.get("currency", "USD"),
-            "Bolagsnamn": info.get("shortName", t),
+            "Aktuell kurs": price,
+            "Valuta": currency,
+            "Bolagsnamn": name,
             "Utdelning/år": div_year,
             "Frekvens/år": freq,
             "Ex-Date": ex_date,
@@ -301,38 +347,12 @@ def fetch_yahoo(ticker: str) -> dict:
         st.warning(f"Yahoo-fel {ticker}: {e}")
         return {}
 
-# ── Beräkningar ───────────────────────────────────────────────────────────
-def beräkna_allt(df: pd.DataFrame) -> pd.DataFrame:
-    d = säkerställ_kolumner(df).copy()
-
-    # Val av utdelningskälla
-    d["Utdelning/år_eff"] = d.apply(
-        lambda r: _to_float(r["Utdelning/år (manuell)"]) if bool(r.get("Lås utdelning")) and _to_float(r["Utdelning/år (manuell)"])>0
-        else _to_float(r["Utdelning/år"]), axis=1
-    )
-    d["Utdelningskälla"] = d.apply(
-        lambda r: "Manuell 🔒" if bool(r.get("Lås utdelning")) and _to_float(r["Utdelning/år (manuell)"])>0 else "Yahoo", axis=1
-    )
-
-    # Kurs i SEK
-    d["Kurs (SEK)"] = (d["Aktuell kurs"].apply(_to_float) * d["Valuta"].map(fx_for)).round(6)
-
-    # Marknadsvärde och andel
-    d["Marknadsvärde (SEK)"] = (d["Antal aktier"].apply(_to_float) * d["Kurs (SEK)"]).round(2)
-    tot_mv = float(d["Marknadsvärde (SEK)"].sum()) or 1.0
-    d["Portföljandel (%)"] = (100.0 * d["Marknadsvärde (SEK)"] / tot_mv).round(2)
-
-    # Insatt i SEK (GAV i lokal * qty * FX)
-    d["Insatt (SEK)"] = (d["Antal aktier"].apply(_to_float) * d["GAV"].apply(_to_float) * d["Valuta"].map(fx_for)).round(2)
-
-    # Utdelning i SEK & DA
-    d["Årlig utdelning (SEK)"] = (d["Antal aktier"].apply(_to_float) * d["Utdelning/år_eff"].apply(_to_float) * d["Valuta"].map(fx_for)).round(2)
-    d["Direktavkastning (%)"] = d.apply(lambda r: (100.0 * _to_float(r["Utdelning/år_eff"]) / _to_float(r["Aktuell kurs"])) if _to_float(r["Aktuell kurs"])>0 else 0.0, axis=1).round(2)
-
-    return d
-
-# ── Nästa utdelning (estimerad) ───────────────────────────────────────────
+# ── Nästa utdelning (estimerad utifrån Ex-Date, frekvens & betalningslag) ─
 def nästa_utd_datum(row):
+    """
+    Givet radens Ex-Date (senaste kända), Frekvens/år och Payment-lag (dagar),
+    rulla fram nästa betalningsdatum (estimerat).
+    """
     try:
         freq = int(_to_float(row.get("Frekvens/år", 0)))
         if freq <= 0:
@@ -342,12 +362,13 @@ def nästa_utd_datum(row):
             return ""
         exdate = datetime.strptime(exdate_str, "%Y-%m-%d").date()
         pay_lag = int(_to_float(row.get("Payment-lag (dagar)", 30)))
-        # approximera nästa ex-date framåt
-        step_days = max(1, int(round(365.0 / max(freq,1))))
+
+        step_days = max(1, int(round(365.0 / max(freq, 1))))
         today_d = date.today()
+        # Rulla ex-date framåt tills den ligger i framtiden
         while exdate < today_d:
             exdate = exdate + timedelta(days=step_days)
-        pay_date = exdate + timedelta(days=pay_lag)
+        pay_date = exdate + timedelta(days=max(0, pay_lag))
         return pay_date.strftime("%Y-%m-%d")
     except Exception:
         return ""
@@ -357,22 +378,45 @@ def uppdatera_nästa_utd(df: pd.DataFrame) -> pd.DataFrame:
     d["Nästa utbetalning (est)"] = d.apply(nästa_utd_datum, axis=1)
     return d
 
-# ── Transaktionslogg ──────────────────────────────────────────────────────
-def _ensure_tx_sheet():
-    sh = _open_sheet()
-    try:
-        return sh.worksheet(TX_SHEET)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=TX_SHEET, rows=1000, cols=8)
-        ws.update([["Datum","Ticker","Bolagsnamn","Antal","Kurs","Valuta","Total SEK","Kommentar"]],
-                  value_input_option="RAW")
-        return ws
+# ── Beräkningar (robusta casts till float) ────────────────────────────────
+def beräkna_allt(df: pd.DataFrame) -> pd.DataFrame:
+    d = säkerställ_kolumner(df).copy()
 
-def logga_transaktioner(rows: list):
-    ws = _ensure_tx_sheet()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    for r in rows:
-        ws.append_row([now] + r, value_input_option="RAW")
+    # Kategori som text (fallback)
+    d["Kategori"] = d["Kategori"].astype(str).replace({"": "QUALITY"})
+
+    # Lås/Manuell utdelning
+    lock = d["Lås utdelning"].apply(lambda x: bool(x))
+    div_manual = pd.to_numeric(d["Utdelning/år (manuell)"].apply(_to_float), errors="coerce").fillna(0.0).astype(float)
+    div_yahoo  = pd.to_numeric(d["Utdelning/år"].apply(_to_float),        errors="coerce").fillna(0.0).astype(float)
+    d["Utdelning/år_eff"] = div_yahoo.copy()
+    d.loc[(lock) & (div_manual > 0), "Utdelning/år_eff"] = div_manual
+    d["Utdelningskälla"] = ["Manuell 🔒" if (l and m>0) else "Yahoo" for l, m in zip(lock, div_manual)]
+
+    # Pris & FX
+    prices = pd.to_numeric(d["Aktuell kurs"].apply(_to_float), errors="coerce").fillna(0.0).astype(float)
+    rates  = pd.to_numeric(d["Valuta"].apply(fx_for),          errors="coerce").fillna(1.0).astype(float)
+    d["Kurs (SEK)"] = (prices * rates).astype(float).round(6)
+
+    # Antal/GAV (GAV i lokal valuta)
+    qty = pd.to_numeric(d["Antal aktier"], errors="coerce").fillna(0.0).astype(float)
+    gav = pd.to_numeric(d["GAV"],          errors="coerce").fillna(0.0).astype(float)
+    div_eff = pd.to_numeric(d["Utdelning/år_eff"], errors="coerce").fillna(0.0).astype(float)
+
+    # Marknadsvärde, andel
+    d["Marknadsvärde (SEK)"] = (qty * d["Kurs (SEK)"]).astype(float).round(2)
+    tot_mv = float(d["Marknadsvärde (SEK)"].sum()) or 1.0
+    d["Portföljandel (%)"] = (100.0 * d["Marknadsvärde (SEK)"] / tot_mv).astype(float).round(2)
+
+    # Insatt (SEK) & utdelning (SEK)
+    d["Insatt (SEK)"] = (qty * gav * rates).astype(float).round(2)
+    d["Årlig utdelning (SEK)"] = (qty * div_eff * rates).astype(float).round(2)
+
+    # Direktavkastning
+    safe_price = prices.replace(0, pd.NA)
+    d["Direktavkastning (%)"] = (100.0 * div_eff / safe_price).fillna(0.0).astype(float).round(2)
+
+    return d
 
 # ── Avgifter (Avanza/Nordnet mini + FX) ───────────────────────────────────
 MIN_COURTAGE_RATE = 0.0025
@@ -534,33 +578,6 @@ def page_add_or_update(df: pd.DataFrame) -> pd.DataFrame:
                 spara_data(base)
                 st.success(f"{val} borttagen.")
 
-    return base
-
-# ── Massuppdatering ───────────────────────────────────────────────────────
-def page_mass_update(df: pd.DataFrame) -> pd.DataFrame:
-    st.subheader("⏩ Massuppdatera alla bolag (Yahoo)")
-    base = säkerställ_kolumner(df).copy()
-    if base.empty:
-        st.info("Inga bolag i databasen ännu.")
-        return base
-
-    if st.button("Starta massuppdatering"):
-        progress = st.progress(0)
-        status   = st.empty()
-        N = len(base)
-        for i, tkr in enumerate(base["Ticker"].tolist(), start=1):
-            status.write(f"Uppdaterar {tkr} ({i}/{N}) …")
-            vals = fetch_yahoo(tkr)
-            m = base["Ticker"]==tkr
-            for k in ["Aktuell kurs","Valuta","Bolagsnamn","Utdelning/år","Frekvens/år","Ex-Date","Källa"]:
-                if k in vals and vals[k] not in (None,""):
-                    base.loc[m,k] = vals[k]
-            base = beräkna_allt(base)
-            base = uppdatera_nästa_utd(base)
-            progress.progress(int(i*100/N))
-            time.sleep(1.0)  # respekt mot Yahoo
-        spara_data(base)
-        st.success("Massuppdatering klar!")
     return base
 
 # ── Köpsimulator (≈500 kr‑lotter) ─────────────────────────────────────────
@@ -749,6 +766,56 @@ def page_calendar(df: pd.DataFrame):
     st.bar_chart(monthly.set_index("Månad")["Utdelning (SEK)"])
     with st.expander("Detaljer per betalning"):
         st.dataframe(cal.sort_values("Datum"), use_container_width=True)
+
+# ── Transaktionslogg (säkerställ flik + append) ───────────────────────────
+def _ensure_tx_sheet():
+    sh = _open_sheet()
+    try:
+        return sh.worksheet(TX_SHEET)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=TX_SHEET, rows=1000, cols=8)
+        ws.update([["Datum","Ticker","Bolagsnamn","Antal","Kurs","Valuta","Total SEK","Kommentar"]],
+                  value_input_option="RAW")
+        return ws
+
+def logga_transaktioner(rows: list):
+    """
+    rows: lista av [Ticker, Bolagsnamn (kan ''), Antal, Kurs (SEK), Valuta, Total SEK, Kommentar]
+    """
+    ws = _ensure_tx_sheet()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    out = []
+    for r in rows:
+        out.append([now] + r)
+    if out:
+        ws.append_rows(out, value_input_option="RAW")
+
+# ── Massuppdatering ───────────────────────────────────────────────────────
+def page_mass_update(df: pd.DataFrame) -> pd.DataFrame:
+    st.subheader("⏩ Massuppdatera alla bolag (Yahoo)")
+    base = säkerställ_kolumner(df).copy()
+    if base.empty:
+        st.info("Inga bolag i databasen ännu.")
+        return base
+
+    if st.button("Starta massuppdatering"):
+        progress = st.progress(0)
+        status   = st.empty()
+        N = len(base)
+        for i, tkr in enumerate(base["Ticker"].tolist(), start=1):
+            status.write(f"Uppdaterar {tkr} ({i}/{N}) …")
+            vals = fetch_yahoo(tkr)
+            m = base["Ticker"]==tkr
+            for k in ["Aktuell kurs","Valuta","Bolagsnamn","Utdelning/år","Frekvens/år","Ex-Date","Källa"]:
+                if k in vals and vals[k] not in (None,""):
+                    base.loc[m,k] = vals[k]
+            base = beräkna_allt(base)
+            base = uppdatera_nästa_utd(base)
+            progress.progress(int(i*100/N))
+            time.sleep(1.0)  # respekt mot Yahoo
+        spara_data(base)
+        st.success("Massuppdatering klar!")
+    return base
 
 # ── Spara ─────────────────────────────────────────────────────────────────
 def page_save(df: pd.DataFrame):
