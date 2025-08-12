@@ -52,7 +52,8 @@ def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
     d["Valuta"] = d["Valuta"].astype(str).str.strip().str.upper()
     d["Kategori"] = d["Kategori"].astype(str).replace({"": "QUALITY"})
     # numeriska
-    num_cols = ["Aktuell kurs","Utdelning/år","Utdelning/år (manuell)","Frekvens/år","Payment-lag (dagar)","Antal aktier","GAV","Marknadsvärde (SEK)"]
+    num_cols = ["Aktuell kurs","Utdelning/år","Utdelning/år (manuell)","Frekvens/år",
+                "Payment-lag (dagar)","Antal aktier","GAV","Marknadsvärde (SEK)"]
     for c in num_cols:
         d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
     # bool
@@ -60,7 +61,8 @@ def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
         d["Lås utdelning"] = d["Lås utdelning"].apply(lambda x: bool(x) if pd.notna(x) else False)
     else:
         d["Lås utdelning"] = False
-    for add in ["Frekvenskälla","Utdelningskälla","Senaste uppdatering","Källa","Utdelningsfrekvens","Ex-Date","Nästa utbetalning (est)"]:
+    for add in ["Frekvenskälla","Utdelningskälla","Senaste uppdatering","Källa",
+                "Utdelningsfrekvens","Ex-Date","Nästa utbetalning (est)"]:
         if add not in d.columns:
             d[add] = ""
     if "Utdelningskälla" not in d.columns:
@@ -372,7 +374,7 @@ def refresh_all_from_yahoo(df: pd.DataFrame, sleep_s: float = 1.0, show_progress
             if vals.get("valuta"):
                 d.loc[m, "Valuta"] = vals["valuta"]
 
-            # Utdelning enligt regeln
+            # Utdelning enligt regeln: Yahoo om >0, annars manuell om >0, annars 0
             manual = float(pd.to_numeric(d.loc[m, "Utdelning/år (manuell)"].iloc[0], errors="coerce") or 0.0)
             new_div = float(vals.get("utdelning") or 0.0)
             if new_div > 0:
@@ -496,7 +498,6 @@ def suggest_buys(df: pd.DataFrame,
 
     da = pd.to_numeric(d.loc[keep_idx, "Direktavkastning (%)"], errors="coerce").fillna(0.0)
     da_score = (da.clip(lower=0, upper=15) / 15.0) * 100.0
-
     under = (GLOBAL_MAX_NAME - d.loc[keep_idx, "Portföljandel (%)"]).clip(lower=0)
     under_score = (under / GLOBAL_MAX_NAME) * 100.0
 
@@ -533,6 +534,10 @@ def suggest_buys(df: pd.DataFrame,
         if denom <= 0: return 0
         return int(max(0, math.floor(numer / denom)))
 
+    # --- bootstrap‑fix: hoppa över 1‑aktie‑spärren när portföljen saknar värde ---
+    T_now_global = float(d["Marknadsvärde (SEK)"].sum())
+    bootstrap_mode = (T_now_global <= 0)
+
     for i in order:
         tkr = str(d.at[i,"Ticker"])
         price = float(pd.to_numeric(d.at[i,"Kurs (SEK)"], errors="coerce") or 0.0)
@@ -544,18 +549,21 @@ def suggest_buys(df: pd.DataFrame,
         Vi  = float(d.at[i,"Marknadsvärde (SEK)"])
         C   = float(cat_values.get(cat, 0.0))
 
-        Vi2 = Vi + price
-        T2  = float(d["Marknadsvärde (SEK)"].sum()) + price
-        w_after = 100.0 * Vi2 / T2 if T2 > 0 else 0.0
-        if T2 > 0 and w_after > (GLOBAL_MAX_NAME + tol) + 1e-9:
-            diag.append({"Ticker": tkr, "Skäl": f"1 st skulle överskrida bolagstak {GLOBAL_MAX_NAME:.1f}%"})
-            continue
-        C2 = C + price
-        cat_after = 100.0 * C2 / T2 if T2 > 0 else 0.0
-        if T2 > 0 and cat_after > (MAX_CAT.get(cat, 100.0) + tol) + 1e-9:
-            diag.append({"Ticker": tkr, "Skäl": f"1 st skulle överskrida kategori‑tak {MAX_CAT.get(cat,100):.1f}%"})
-            continue
+        if not bootstrap_mode:
+            T_now = float(d["Marknadsvärde (SEK)"].sum())
+            Vi2 = Vi + price
+            T2  = T_now + price
+            w_after = 100.0 * Vi2 / T2 if T2 > 0 else 0.0
+            if T2 > 0 and w_after > (GLOBAL_MAX_NAME + tol) + 1e-9:
+                diag.append({"Ticker": tkr, "Skäl": f"1 st skulle överskrida bolagstak {GLOBAL_MAX_NAME:.1f}%"})
+                continue
+            C2 = C + price
+            cat_after = 100.0 * C2 / T2 if T2 > 0 else 0.0
+            if T2 > 0 and cat_after > (MAX_CAT.get(cat, 100.0) + tol) + 1e-9:
+                diag.append({"Ticker": tkr, "Skäl": f"1 st skulle överskrida kategori‑tak {MAX_CAT.get(cat,100):.1f}%"})
+                continue
 
+        # beräkna max kapacitet enligt regler
         T = float(d["Marknadsvärde (SEK)"].sum())
         if T <= 0:
             n_name_cap = 10**9
@@ -577,7 +585,7 @@ def suggest_buys(df: pd.DataFrame,
             "Rek. (st)": int(n_reco),
             "Max enl. regler (st)": int(n_max),
             "Kostnad 1 st (SEK)": round(price,2),
-            "Motivering": f"Ryms inom {GLOBAL_MAX_NAME:.0f}% & kategori≤{MAX_CAT.get(cat,100):.0f}%"
+            "Motivering": f"{'Bootstrap-läge – första köp tillåts. ' if bootstrap_mode else ''}Ryms inom {GLOBAL_MAX_NAME:.0f}% & kategori≤{MAX_CAT.get(cat,100):.0f}%"
         })
 
         if len(rows) >= topk:
@@ -804,13 +812,11 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame) -> pd.DataFrame:
         if st.button("📥 Lägg till i minnet (pending)"):
             if not ticker:
                 st.error("Ticker måste anges."); return df
-            # skapa/uppdatera pending-rad (minimal input; resten hämtas vid spara)
             row = {
                 "Ticker": ticker, "Antal aktier": float(antal), "GAV": float(gav),
                 "Kategori": kategori, "Utdelning/år (manuell)": float(man_utd),
                 "Lås utdelning": bool(lås)
             }
-            # hämta snabb Yahoo för att visa prelim värden i pending
             vals = hamta_yahoo_data(ticker)
             if vals:
                 row.update({
@@ -948,9 +954,11 @@ def portfolj_oversikt(df: pd.DataFrame) -> pd.DataFrame:
     st.subheader("📦 Portföljöversikt")
     d = beräkna(df).copy()
 
-    d["Insatt (SEK)"] = (pd.to_numeric(d["Antal aktier"], errors="coerce").fillna(0.0) * pd.to_numeric(d["GAV"], errors="coerce").fillna(0.0)).round(2)
+    d["Insatt (SEK)"] = (pd.to_numeric(d["Antal aktier"], errors="coerce").fillna(0.0) *
+                         pd.to_numeric(d["GAV"], errors="coerce").fillna(0.0)).round(2)
     d["Orealiserad P/L (SEK)"] = (d["Marknadsvärde (SEK)"] - d["Insatt (SEK)"]).round(2)
-    d["Orealiserad P/L (%)"] = (100.0 * d["Orealiserad P/L (SEK)"] / d["Insatt (SEK)"].replace({0: pd.NA})).fillna(0.0).round(2)
+    d["Orealiserad P/L (%)"] = (100.0 * d["Orealiserad P/L (SEK)"] /
+                                d["Insatt (SEK)"].replace({0: pd.NA})).fillna(0.0).round(2)
 
     tot_mv, tot_ins = float(d["Marknadsvärde (SEK)"].sum()), float(d["Insatt (SEK)"].sum())
     tot_pl, tot_div = float(d["Orealiserad P/L (SEK)"].sum()), float(d["Årlig utdelning (SEK)"].sum())
@@ -958,7 +966,8 @@ def portfolj_oversikt(df: pd.DataFrame) -> pd.DataFrame:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Portföljvärde", f"{round(tot_mv,2):,}".replace(",", " "))
     c2.metric("Insatt kapital", f"{round(tot_ins,2):,}".replace(",", " "))
-    c3.metric("Orealiserad P/L", f"{round(tot_pl,2):,}".replace(",", " "), delta=f"{(0 if tot_ins==0 else (100*tot_pl/tot_ins)):.2f}%")
+    c3.metric("Orealiserad P/L", f"{round(tot_pl,2):,}".replace(",", " "),
+              delta=f"{(0 if tot_ins==0 else (100*tot_pl/tot_ins)):.2f}%")
     c4.metric("Årsutdelning", f"{round(tot_div,2):,}".replace(",", " "))
 
     locked_count = int(((d["Lås utdelning"] == True) & (d["Utdelning/år (manuell)"] > 0)).sum())
@@ -1058,7 +1067,9 @@ def page_save_now(df: pd.DataFrame):
     st.subheader("💾 Spara till Google Sheets")
     preview = beräkna( säkerställ_kolumner(df) )
     st.write("Antal rader som sparas:", len(preview))
-    st.dataframe(preview[["Ticker","Bolagsnamn","Valuta","Kategori","Antal aktier","GAV","Aktuell kurs","Utdelning/år","Kurs (SEK)","Årlig utdelning (SEK)"]], use_container_width=True)
+    st.dataframe(preview[["Ticker","Bolagsnamn","Valuta","Kategori","Antal aktier","GAV",
+                          "Aktuell kurs","Utdelning/år","Kurs (SEK)","Årlig utdelning (SEK)"]],
+                 use_container_width=True)
     if st.button("✅ Bekräfta och spara"):
         if preview["Ticker"].astype(str).str.strip().eq("").all():
             st.error("Inget att spara: inga tickers i tabellen."); return df
