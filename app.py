@@ -45,12 +45,47 @@ def hamta_data():
         st.warning(f"Kunde inte läsa Google Sheet just nu: {e}")
         return pd.DataFrame()
 
+# ── Kolumnschema ───────────────────────────────────────────────────────────
+COLUMNS = [
+    "Ticker", "Bolagsnamn", "Aktuell kurs", "Valuta", "Kategori",
+    "Direktavkastning (%)", "Utdelning/år", "Utdelning/år (manuell)", "Lås utdelning",
+    "Frekvens/år", "Utdelningsfrekvens", "Frekvenskälla",
+    "Payment-lag (dagar)", "Ex-Date", "Nästa utbetalning (est)",
+    "Antal aktier", "GAV", "Portföljandel (%)", "Årlig utdelning (SEK)",
+    "Kurs (SEK)", "Utdelningstillväxt (%)", "Utdelningskälla",
+    "Senaste uppdatering", "Källa"
+]
+
+def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    if d.empty:
+        d = pd.DataFrame(columns=COLUMNS)
+    for c in COLUMNS:
+        if c not in d.columns:
+            d[c] = ""
+    # datatyper / defaults
+    d["Ticker"] = d["Ticker"].astype(str).str.strip().str.upper()
+    d["Valuta"] = d["Valuta"].astype(str).str.strip().str.upper()
+    d["Kategori"] = d["Kategori"].astype(str).replace({"": "QUALITY"})
+    num_cols = ["Aktuell kurs","Utdelning/år","Utdelning/år (manuell)","Frekvens/år","Payment-lag (dagar)","Antal aktier","GAV"]
+    for c in num_cols:
+        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
+    if "Lås utdelning" in d.columns:
+        d["Lås utdelning"] = d["Lås utdelning"].apply(lambda x: bool(x) if pd.notna(x) else False)
+    else:
+        d["Lås utdelning"] = False
+    if "Frekvenskälla" not in d.columns:
+        d["Frekvenskälla"] = ""
+    d["Utdelningskälla"] = d.get("Utdelningskälla", "Yahoo")
+    return d[COLUMNS].copy()
+
 def migrate_sheet_columns():
     raw = hamta_data()
     fixed = säkerställ_kolumner(raw)
     try:
-        if raw.empty:
-            spara_data(fixed)
+        # Om bladet är tomt: initiera med korrekt schema
+        if raw.empty and (len(fixed.columns) == len(COLUMNS)):
+            spara_data(fixed.head(0))  # spara bara header
         elif list(raw.columns) != list(fixed.columns) or raw.shape[1] != fixed.shape[1]:
             spara_data(fixed)
     except Exception as e:
@@ -76,43 +111,76 @@ def fx_for(cur: str) -> float:
     }
     return float(m.get(c, 1.0))
 
-# ── Kolumnschema ───────────────────────────────────────────────────────────
-COLUMNS = [
-    "Ticker", "Bolagsnamn", "Aktuell kurs", "Valuta", "Kategori",
-    "Direktavkastning (%)", "Utdelning/år", "Utdelning/år (manuell)", "Lås utdelning",
-    "Frekvens/år", "Utdelningsfrekvens",
-    "Payment-lag (dagar)", "Ex-Date", "Nästa utbetalning (est)",
-    "Antal aktier", "GAV", "Portföljandel (%)", "Årlig utdelning (SEK)",
-    "Kurs (SEK)", "Utdelningstillväxt (%)", "Utdelningskälla",
-    "Senaste uppdatering", "Källa"
-]
+# ── Intervall-baserad frekvensdetektion ────────────────────────────────────
+def _infer_frequency_from_divs(divs: pd.Series):
+    """
+    divs: pandas Series med index = DatetimeIndex (betalningsdatum) och värden = belopp.
+    Heuristik:
+      1) Titta 24m bakåt. Om >=10 betalningar, och medianintervall ~30±10 => 12 ggr/år (Månads)
+      2) Annars: använd 12m fönster. Räkna antal betalningar:
+         >=10 => 12 (Månads), 3–5 => 4 (Kvartals), 2 => 2 (Halvårs), 1 => 1 (Års)
+      3) Om blandat (t.ex. övergång Q->M): använd senaste 10 betalningar och titta på
+         medianintervall: ~30 => 12, ~90 => 4, ~180 => 2, ~365 => 1.
+    Return: (freq:int, freq_text:str, source:str)
+    """
+    if divs is None or divs.empty:
+        return 0, "Oregelbunden", "Ingen historik"
 
-def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
-    if d.empty:
-        d = pd.DataFrame(columns=COLUMNS)
-    for c in COLUMNS:
-        if c not in d.columns:
-            d[c] = ""
-    # datatyper / defaults
-    d["Ticker"] = d["Ticker"].astype(str).str.strip().str.upper()
-    d["Valuta"] = d["Valuta"].astype(str).str.strip().str.upper()
-    d["Kategori"] = d["Kategori"].astype(str).replace({"": "QUALITY"})
-    num_cols = ["Aktuell kurs","Utdelning/år","Utdelning/år (manuell)","Frekvens/år","Payment-lag (dagar)","Antal aktier","GAV"]
-    for c in num_cols:
-        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
-    if "Lås utdelning" in d.columns:
-        d["Lås utdelning"] = d["Lås utdelning"].apply(lambda x: bool(x) if pd.notna(x) else False)
-    else:
-        d["Lås utdelning"] = False
-    d["Utdelningskälla"] = d.get("Utdelningskälla", "Yahoo")
-    return d[COLUMNS].copy()
+    # sortera
+    divs = divs.sort_index()
+    now = pd.Timestamp.utcnow()
+    last24 = divs[divs.index >= (now - pd.Timedelta(days=730))]
+    last12 = divs[divs.index >= (now - pd.Timedelta(days=365))]
 
-# ── Yahoo Finance: pris, valuta, utdelning (12m), frekvens & Ex-Date ───────
+    def label_for(n):
+        return {12:"Månads",4:"Kvartals",2:"Halvårs",1:"Års"}.get(n, "Oregelbunden")
+
+    def freq_by_intervals(series, src_label):
+        idx = series.index.sort_values()
+        if len(idx) < 2:
+            n = min(max(len(series), 0), 1)
+            return n, label_for(n), f"{src_label} (count)"
+        diffs = (idx[1:] - idx[:-1]).days
+        med = float(pd.Series(diffs).median())
+        # tolerance "band"
+        if 20 <= med <= 45:   return 12, "Månads", f"{src_label} (median≈{med:.0f}d)"
+        if 60 <= med <= 110:  return 4,  "Kvartals", f"{src_label} (median≈{med:.0f}d)"
+        if 130 <= med <= 210: return 2,  "Halvårs",  f"{src_label} (median≈{med:.0f}d)"
+        if 300 <= med <= 430: return 1,  "Års",      f"{src_label} (median≈{med:.0f}d)"
+        # fallback med counts
+        n = len(series)
+        if n >= 10: return 12, "Månads",  f"{src_label} (>=10 st)"
+        if 3 <= n <= 5: return 4, "Kvartals", f"{src_label} (3–5 st)"
+        if n == 2: return 2, "Halvårs", f"{src_label} (2 st)"
+        if n == 1: return 1, "Års", f"{src_label} (1 st)"
+        return 0, "Oregelbunden", f"{src_label} (spridda)"
+
+    # 1) 24 mån
+    if len(last24) >= 10:
+        f, t, src = freq_by_intervals(last24, "Historik 24m")
+        if f in (12,4,2,1):
+            return f, t, src
+
+    # 2) 12 mån
+    if len(last12) > 0:
+        # om många betalningar senaste året → kör intervall/median
+        f, t, src = freq_by_intervals(last12, "Historik 12m")
+        if f in (12,4,2,1):
+            return f, t, src
+
+    # 3) Senaste 10 betalningar
+    recent = divs.tail(10)
+    if not recent.empty:
+        f, t, src = freq_by_intervals(recent, "Senaste 10")
+        return f, t, src
+
+    return 0, "Oregelbunden", "Ingen historik"
+
+# ── Yahoo Finance: pris, valuta, utdelning, frekvens & Ex-Date ─────────────
 def hamta_yahoo_data(ticker: str):
     """
     Hämtar kurs, valuta, utdelning/år (summa senaste 12 mån),
-    utdelningsfrekvens från historik, samt Ex-Date.
+    utdelningsfrekvens via intervall-analys, samt Ex-Date.
     """
     try:
         t = yf.Ticker(ticker)
@@ -150,35 +218,28 @@ def hamta_yahoo_data(ticker: str):
             except Exception:
                 currency = "SEK"
 
-        # Utdelningshistorik → frekvens + 12m-summa
+        # Utdelningshistorik → intervall-frekvens + 12m-summa
         div_rate = 0.0
         freq = 0
         freq_text = "Oregelbunden"
+        freq_src = "Ingen historik"
         ex_date_str = ""
         try:
             divs = t.dividends
             if divs is not None and not divs.empty:
+                # 12m-summa
                 cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=365)
                 last12 = divs[divs.index >= cutoff]
                 div_rate = float(last12.sum()) if not last12.empty else 0.0
-
-                cnt = int(last12.shape[0]) if not last12.empty else 0
-                if cnt >= 10:
-                    freq, freq_text = 12, "Månads"
-                elif cnt >= 3:
-                    freq, freq_text = 4, "Kvartals"
-                elif cnt == 2:
-                    freq, freq_text = 2, "Halvårs"
-                elif cnt == 1:
-                    freq, freq_text = 1, "Års"
-                else:
-                    freq, freq_text = 0, "Oregelbunden"
-
+                # frekvens
+                f, ft, src = _infer_frequency_from_divs(divs)
+                freq, freq_text, freq_src = f, ft, src
+                # ex-date (senaste)
                 ex_date_str = pd.to_datetime(divs.index.max()).strftime("%Y-%m-%d")
         except Exception:
             pass
 
-        # Fallback om historik saknas
+        # Fallback om historik saknas (forward/trailing)
         if div_rate == 0.0:
             try:
                 fwd = info.get("forwardAnnualDividendRate")
@@ -209,6 +270,7 @@ def hamta_yahoo_data(ticker: str):
             "utdelning": div_rate,
             "frekvens": freq,
             "frekvens_text": freq_text,
+            "frekvens_källa": freq_src,
             "ex_date": ex_date_str,
             "källa": "Yahoo",
             "uppdaterad": datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -266,9 +328,11 @@ def lagg_till_eller_uppdatera(df: pd.DataFrame) -> pd.DataFrame:
             if data_y.get("valuta"): df.loc[m, "Valuta"] = data_y["valuta"]
             f = int(data_y.get("frekvens") or 0)
             ft = data_y.get("frekvens_text") or ""
+            fsrc = data_y.get("frekvens_källa") or ""
             xd = data_y.get("ex_date") or ""
             if f > 0: df.loc[m, "Frekvens/år"] = f
             if ft: df.loc[m, "Utdelningsfrekvens"] = ft
+            if fsrc: df.loc[m, "Frekvenskälla"] = fsrc
             if xd: df.loc[m, "Ex-Date"] = xd
             df.loc[m, "Källa"] = "Yahoo"
             if data_y.get("uppdaterad"):
@@ -297,9 +361,11 @@ def uppdatera_bolag(df: pd.DataFrame) -> pd.DataFrame:
             if data_y.get("valuta"): df.loc[m, "Valuta"] = data_y["valuta"]
             f = int(data_y.get("frekvens") or 0)
             ft = data_y.get("frekvens_text") or ""
+            fsrc = data_y.get("frekvens_källa") or ""
             xd = data_y.get("ex_date") or ""
             if f > 0: df.loc[m, "Frekvens/år"] = f
             if ft: df.loc[m, "Utdelningsfrekvens"] = ft
+            if fsrc: df.loc[m, "Frekvenskälla"] = fsrc
             if xd: df.loc[m, "Ex-Date"] = xd
             df.loc[m, "Källa"] = "Yahoo"
             if data_y.get("uppdaterad"):
@@ -330,9 +396,11 @@ def massuppdatera(df: pd.DataFrame) -> pd.DataFrame:
                 if data_y.get("valuta"): df.loc[m, "Valuta"] = data_y["valuta"]
                 f = int(data_y.get("frekvens") or 0)
                 ft = data_y.get("frekvens_text") or ""
+                fsrc = data_y.get("frekvens_källa") or ""
                 xd = data_y.get("ex_date") or ""
                 if f > 0: df.loc[m, "Frekvens/år"] = f
                 if ft: df.loc[m, "Utdelningsfrekvens"] = ft
+                if fsrc: df.loc[m, "Frekvenskälla"] = fsrc
                 if xd: df.loc[m, "Ex-Date"] = xd
                 df.loc[m, "Källa"] = "Yahoo"
                 if data_y.get("uppdaterad"):
@@ -510,15 +578,6 @@ def _cap_shares_by_category(C: float, T: float, price_sek: float, cat_max_pct: f
 def suggest_buys(df: pd.DataFrame,
                  w_val: float=0.5, w_under: float=0.35, w_time: float=0.15,
                  topk: int=5, allow_margin: float=0.1, return_debug: bool=False):
-    """
-    Köpförslag IGNORERAR kassa helt.
-    Rankar kandidater och föreslår köp som ryms under:
-      - GLOBAL_MAX_NAME (ex 12%) + liten marginal (allow_margin, p-enheter)
-      - Kategori-tak (MAX_CAT)
-    Returnerar:
-      - Rek. (st) = 1 (minsta steg – alltid konkret)
-      - Max enl. regler (st) = teoretiskt max enligt vikt/kategori
-    """
     d = beräkna(df).copy()
     cols = ["Ticker","Kategori","Poäng","DA %","Vikt %","Nästa utb",
             "Rek. (st)","Max enl. regler (st)","Kostnad 1 st (SEK)","Motivering"]
@@ -565,7 +624,6 @@ def suggest_buys(df: pd.DataFrame,
         C   = float(cat_values.get(cat, 0.0))
         foreign = str(d.at[i,"Valuta"]).upper() != "SEK"
 
-        # Teoretiska tak (T kan vara 0)
         if T <= 0:
             n_name_cap = 10**9
             n_cat_cap  = 10**9
@@ -575,7 +633,6 @@ def suggest_buys(df: pd.DataFrame,
 
         n_max = int(max(0, min(n_name_cap, n_cat_cap)))
         if n_max <= 0:
-            # testa om 1 st funkar ändå (vid liten portfölj eller nära gräns)
             Vi2 = Vi + price
             T2  = T + price if T > 0 else price
             w_after = 100.0 * Vi2 / T2 if T2 > 0 else 0.0
@@ -588,7 +645,7 @@ def suggest_buys(df: pd.DataFrame,
                 if cat_after > get_cat_max(cat) + 1e-9:
                     reasons.append({"Ticker": tkr, "Skäl": "Överskrider kategori-tak"})
                     continue
-            n_max = 1  # minst 1 st
+            n_max = 1
 
         n_reco = 1  # minsta steg
 
@@ -643,7 +700,7 @@ def portfolj_oversikt(df: pd.DataFrame) -> pd.DataFrame:
         "Antal aktier","GAV","Insatt (SEK)","Marknadsvärde (SEK)",
         "Orealiserad P/L (SEK)","Orealiserad P/L (%)",
         "Direktavkastning (%)","Utdelning/år","Utdelning/år (manuell)","Lås utdelning","Utdelningskälla",
-        "Utdelningsfrekvens","Frekvens/år","Årlig utdelning (SEK)",
+        "Utdelningsfrekvens","Frekvens/år","Frekvenskälla","Årlig utdelning (SEK)",
         "Ex-Date","Nästa utbetalning (est)","Portföljandel (%)","Senaste uppdatering"
     ]
     edit_cols = ["Antal aktier","GAV","Frekvens/år","Payment-lag (dagar)","Kategori","Utdelning/år (manuell)","Lås utdelning"]
@@ -652,7 +709,8 @@ def portfolj_oversikt(df: pd.DataFrame) -> pd.DataFrame:
         d[show_cols], hide_index=True, num_rows="dynamic", use_container_width=True,
         column_config={
             "Kategori": st.column_config.SelectboxColumn("Kategori", options=CATEGORY_CHOICES, default="QUALITY", required=True),
-            "Utdelningskälla": st.column_config.TextColumn("Utdelningskälla", help="“Manuell 🔒” när lås+manuell > 0, annars Yahoo.", disabled=True)
+            "Utdelningskälla": st.column_config.TextColumn("Utdelningskälla", help="“Manuell 🔒” när lås+manuell > 0, annars Yahoo.", disabled=True),
+            "Frekvenskälla": st.column_config.TextColumn("Frekvenskälla", help="Hur utdelningsfrekvensen beräknats.", disabled=True),
         }
     )
 
@@ -678,9 +736,11 @@ def portfolj_oversikt(df: pd.DataFrame) -> pd.DataFrame:
                         if vals.get("valuta"): base.loc[m, "Valuta"] = vals.get("valuta")
                         f = int(vals.get("frekvens") or 0)
                         ft = vals.get("frekvens_text") or ""
+                        fsrc = vals.get("frekvens_källa") or ""
                         xd = vals.get("ex_date") or ""
                         if f > 0: base.loc[m, "Frekvens/år"] = f
                         if ft: base.loc[m, "Utdelningsfrekvens"] = ft
+                        if fsrc: base.loc[m, "Frekvenskälla"] = fsrc
                         if xd: base.loc[m, "Ex-Date"] = xd
                         base.loc[m, "Källa"] = "Yahoo"
                         if vals.get("uppdaterad"):
@@ -712,9 +772,11 @@ def portfolj_oversikt(df: pd.DataFrame) -> pd.DataFrame:
                         if vals.get("valuta"): base.loc[m, "Valuta"] = vals.get("valuta")
                         f = int(vals.get("frekvens") or 0)
                         ft = vals.get("frekvens_text") or ""
+                        fsrc = vals.get("frekvens_källa") or ""
                         xd = vals.get("ex_date") or ""
                         if f > 0: base.loc[m, "Frekvens/år"] = f
                         if ft: base.loc[m, "Utdelningsfrekvens"] = ft
+                        if fsrc: base.loc[m, "Frekvenskälla"] = fsrc
                         if xd: base.loc[m, "Ex-Date"] = xd
                         base.loc[m, "Källa"] = "Yahoo"
                         if vals.get("uppdaterad"):
@@ -742,7 +804,7 @@ def portfolj_oversikt(df: pd.DataFrame) -> pd.DataFrame:
             cat_df["Nu (%)"] = (100.0 * cat_df["Marknadsvärde (SEK)"] / T).round(2)
         max_df = pd.DataFrame([{"Kategori": k, "Max (%)": v} for k, v in MAX_CAT.items()])
         merged = pd.merge(max_df, (cat_df[["Kategori","Nu (%)"]] if "Nu (%)" in cat_df.columns else pd.DataFrame(columns=["Kategori","Nu (%)"])),
-                          on="Kategori", how="left").fillna({"Nu (%)": 0.0})
+                          on "Kategori", how="left").fillna({"Nu (%)": 0.0})
         st.dataframe(merged.sort_values("Kategori"), use_container_width=True)
 
         trims = trim_suggestions(d)
@@ -940,7 +1002,7 @@ def block_trading(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-# ── Sidopanel (FX mm.) ─────────────────────────────────────────────────────
+# ── Sidopanel (FX mm. + Läs in-knapp) ──────────────────────────────────────
 def sidopanel():
     st.sidebar.header("⚙️ Inställningar")
     st.sidebar.markdown("**Växelkurser (SEK)**")
@@ -956,6 +1018,15 @@ def sidopanel():
     if st.sidebar.button("↩︎ Återställ FX till standard"):
         for k, v in DEF.items(): st.session_state[k] = v
         _rerun()
+
+    # Läs in från Google Sheets manuellt (om init missade)
+    if st.sidebar.button("🔁 Läs in från Google Sheets"):
+        try:
+            st.session_state["working_df"] = migrate_sheet_columns()
+            st.sidebar.success(f"Läst in {len(st.session_state['working_df'])} rader.")
+            _rerun()
+        except Exception as e:
+            st.sidebar.error(f"Kunde inte läsa in: {e}")
 
     st.sidebar.markdown("---")
     one_ticker = st.sidebar.text_input("Uppdatera EN ticker (Yahoo)", placeholder="t.ex. VICI").strip().upper()
@@ -973,9 +1044,11 @@ def sidopanel():
                 if vals.get("valuta"): base.loc[m, "Valuta"] = vals.get("valuta")
                 f = int(vals.get("frekvens") or 0)
                 ft = vals.get("frekvens_text") or ""
+                fsrc = vals.get("frekvens_källa") or ""
                 xd = vals.get("ex_date") or ""
                 if f > 0: base.loc[m, "Frekvens/år"] = f
                 if ft: base.loc[m, "Utdelningsfrekvens"] = ft
+                if fsrc: base.loc[m, "Frekvenskälla"] = fsrc
                 if xd: base.loc[m, "Ex-Date"] = xd
                 base.loc[m, "Källa"] = "Yahoo"
                 if vals.get("uppdaterad"):
@@ -1004,7 +1077,7 @@ def page_save_now(df: pd.DataFrame):
     st.subheader("💾 Spara till Google Sheets")
     preview = beräkna( säkerställ_kolumner(df) )
     st.write("Antal rader som sparas:", len(preview))
-    st.dataframe(preview[["Ticker","Bolagsnamn","Valuta","Kategori","Antal aktier","GAV","Aktuell kurs","Utdelning/år","Kurs (SEK)","Årlig utdelning (SEK)"]], use_container_width=True)
+    st.dataframe(preview[["Ticker","Bolagsnamn","Valuta","Kategori","Antal aktier","GAV","Aktuell kurs","Utdelning/år","Frekvens/år","Utdelningsfrekvens","Frekvenskälla","Kurs (SEK)","Årlig utdelning (SEK)"]], use_container_width=True)
     if st.button("✅ Bekräfta och spara"):
         if preview["Ticker"].astype(str).str.strip().eq("").all():
             st.error("Inget att spara: inga tickers i tabellen."); return df
