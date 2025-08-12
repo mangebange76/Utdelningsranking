@@ -89,7 +89,7 @@ MAX_CAT = {
     "Finance": 20.0, "Other": 10.0,
 }
 CATEGORY_CHOICES = list(MAX_CAT.keys())
-GLOBAL_MAX_NAME = 12.0
+GLOBAL_MAX_NAME = 7.0
 def get_cat_max(cat: str) -> float:
     return float(MAX_CAT.get(str(cat or "").strip() or "QUALITY", 100.0))
 
