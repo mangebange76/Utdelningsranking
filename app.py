@@ -6,7 +6,7 @@ import time, math
 from datetime import datetime, timedelta, date
 from google.oauth2.service_account import Credentials
 
-# ── Rerun shim
+# ── Rerun shim ─────────────────────────────────────────────────────────────
 try:
     _rerun = st.rerun
 except AttributeError:
@@ -14,7 +14,7 @@ except AttributeError:
 
 st.set_page_config(page_title="Utdelningsportfölj", layout="wide")
 
-# ── Secrets
+# ── Secrets ────────────────────────────────────────────────────────────────
 SHEET_URL  = st.secrets["SHEET_URL"]
 SHEET_NAME = "Bolag"
 
@@ -27,7 +27,7 @@ credentials = Credentials.from_service_account_info(
 )
 client = gspread.authorize(credentials)
 
-# ── Kolumnschema
+# ── Kolumnschema ───────────────────────────────────────────────────────────
 COLUMNS = [
     "Ticker","Bolagsnamn","Aktuell kurs","Valuta","Kategori",
     "Direktavkastning (%)","Utdelning/år","Utdelning/år (manuell)","Lås utdelning",
@@ -38,7 +38,7 @@ COLUMNS = [
     "Senaste uppdatering","Källa","Marknadsvärde (SEK)"
 ]
 
-# ── Robust GAV/nummer-parser
+# ── Robust GAV/nummer-parser ───────────────────────────────────────────────
 def _coerce_decimal(val) -> float:
     if pd.isna(val): return 0.0
     s = str(val).strip()
@@ -81,7 +81,7 @@ def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
         if add not in d.columns: d[add] = ""
     return d[COLUMNS].copy()
 
-# ── Kategoritak (tak ≠ målvikt)
+# ── Kategoritak (tak ≠ målvikter) ─────────────────────────────────────────
 MAX_CAT = {
     "QUALITY": 40.0, "REIT": 25.0, "mREIT": 10.0, "BDC": 15.0, "MLP": 20.0,
     "Shipping": 25.0, "Telecom": 20.0, "Tobacco": 20.0, "Utility": 20.0,
@@ -89,29 +89,51 @@ MAX_CAT = {
     "Finance": 20.0, "Other": 10.0,
 }
 CATEGORY_CHOICES = list(MAX_CAT.keys())
+
+# Max per enskilt bolag (ändra här till 7.0 om du vill!)
 GLOBAL_MAX_NAME = 7.0
+
 def get_cat_max(cat: str) -> float:
     return float(MAX_CAT.get(str(cat or "").strip() or "QUALITY", 100.0))
 
-# ── FX (standardvärden – kan ändras i sidopanelen)
-DEF = {"USDSEK": 9.60, "NOKSEK": 0.94, "CADSEK": 6.95, "EURSEK": 11.10}
+# ── FX defaults (inkl GBP) ─────────────────────────────────────────────────
+DEF = {"USDSEK": 9.60, "NOKSEK": 0.94, "CADSEK": 6.95, "EURSEK": 11.10, "GBPSEK": 12.50}
 for k, v in DEF.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-def fx_for(cur: str) -> float:
-    if pd.isna(cur): return 1.0
-    c = str(cur).strip().upper()
+# ── Gissa valuta från ticker ───────────────────────────────────────────────
+def infer_currency_from_ticker(tkr: str) -> str:
+    if not tkr: return ""
+    s = str(tkr).upper().strip()
+    if s.endswith(".ST"): return "SEK"
+    if s.endswith(".OL"): return "NOK"
+    if s.endswith(".TO") or s.endswith(".TSE"): return "CAD"
+    if s.endswith(".L"):  return "GBP"
+    if s.endswith(".DE"): return "EUR"
+    # Amerikanska tickers brukar sakna suffix → anta USD
+    if "." not in s and "-" not in s and "/" not in s:
+        return "USD"
+    return ""
+
+# ── FX-funktion (nu med ticker-stöd för gissning) ─────────────────────────
+def fx_for(cur: str, ticker: str = "") -> float:
+    c = (str(cur or "").strip().upper())
+    if not c and ticker:
+        c = infer_currency_from_ticker(ticker)
+    if not c:
+        c = "SEK"  # neutral fallback
     m = {
         "USD": st.session_state.get("USDSEK", DEF["USDSEK"]),
         "EUR": st.session_state.get("EURSEK", DEF["EURSEK"]),
         "CAD": st.session_state.get("CADSEK", DEF["CADSEK"]),
         "NOK": st.session_state.get("NOKSEK", DEF["NOKSEK"]),
+        "GBP": st.session_state.get("GBPSEK", DEF["GBPSEK"]),
         "SEK": 1.0
     }
     return float(m.get(c, 1.0))
 
-# ── Google Sheets helpers
+# ── Google Sheets helpers ──────────────────────────────────────────────────
 def _open_sheet():
     try:
         return client.open_by_url(SHEET_URL)
@@ -187,9 +209,8 @@ def spara_data(df: pd.DataFrame):
     except Exception as e:
         st.error("❌ Fel vid sparande."); st.caption(e)
 
-# ── RESET (in‑memory)
+# ── RESET (in‑memory) ──────────────────────────────────────────────────────
 def reset_in_memory():
-    """Återställ appens in-memory-data till det som ligger i Google Sheets."""
     try:
         fresh = migrate_sheet_columns()
         st.session_state["working_df"] = säkerställ_kolumner(fresh)
@@ -199,7 +220,7 @@ def reset_in_memory():
         if k in st.session_state:
             st.session_state.pop(k)
 
-# ── SETTINGS (målvikter) i egen flik
+# ── SETTINGS (målvikter) ───────────────────────────────────────────────────
 SETTINGS_SHEET = "Settings"
 DEFAULT_TARGETS = {
     "Shipping": 10.0,
@@ -264,7 +285,32 @@ def get_ignore_empty_flag():
     _, flag = load_settings()
     return bool(flag)
 
-# ── Frekvens från historik
+# ── Behöver vi uppdatera? ──────────────────────────────────────────────────
+def needs_refresh(df: pd.DataFrame, max_days: int = 3) -> bool:
+    d = säkerställ_kolumner(df)
+    if d.empty:
+        return True
+    # a) Tom/konstig pris/valuta
+    if (pd.to_numeric(d["Aktuell kurs"], errors="coerce").fillna(0.0) <= 0).any():
+        return True
+    if (d["Valuta"].astype(str).str.strip() == "").any():
+        return True
+    # b) utdelning saknas men inte låst manuellt
+    mask_not_locked = ~(d["Lås utdelning"] == True)
+    if (pd.to_numeric(d.loc[mask_not_locked, "Utdelning/år"], errors="coerce").fillna(0.0) <= 0).any():
+        return True
+    # c) gammal stämpel
+    try:
+        ts = pd.to_datetime(d["Senaste uppdatering"], errors="coerce")
+        if ts.notna().any():
+            age_days = (pd.Timestamp.now() - ts.max()).days
+            if age_days > max_days:
+                return True
+    except Exception:
+        pass
+    return False
+
+# ── Frekvens från historik ─────────────────────────────────────────────────
 def _infer_frequency_from_divs(divs: pd.Series):
     if divs is None or divs.empty:
         return 0, "Oregelbunden", "Ingen historik"
@@ -303,7 +349,7 @@ def _infer_frequency_from_divs(divs: pd.Series):
     if not recent.empty: return freq_by_intervals(recent, "Senaste 10")
     return 0, "Oregelbunden", "Ingen historik"
 
-# ── Yahoo
+# ── Yahoo ──────────────────────────────────────────────────────────────────
 def hamta_yahoo_data(ticker: str):
     try:
         t = yf.Ticker(ticker)
@@ -329,7 +375,7 @@ def hamta_yahoo_data(ticker: str):
         currency = (info.get("currency") or "").upper()
         if not currency:
             try: currency = (t.fast_info.get("currency") or "").upper()
-            except Exception: currency = "SEK"
+            except Exception: currency = ""
 
         div_rate, freq, freq_text, freq_src, ex_date_str = 0.0, 0, "Oregelbunden", "Ingen historik", ""
         try:
@@ -373,7 +419,7 @@ def hamta_yahoo_data(ticker: str):
         st.warning(f"Kunde inte hämta Yahoo-data för {ticker}: {e}")
         return None
 
-# ── Beräkningar
+# ── Beräkningar ────────────────────────────────────────────────────────────
 def beräkna(df: pd.DataFrame) -> pd.DataFrame:
     d = säkerställ_kolumner(df).copy()
 
@@ -387,7 +433,7 @@ def beräkna(df: pd.DataFrame) -> pd.DataFrame:
     ]
 
     d["Aktuell kurs"] = pd.to_numeric(d["Aktuell kurs"], errors="coerce").fillna(0.0)
-    rates = d["Valuta"].apply(fx_for).astype(float)
+    rates = d.apply(lambda r: fx_for(r["Valuta"], r["Ticker"]), axis=1).astype(float)
     d["Kurs (SEK)"] = (d["Aktuell kurs"] * rates).round(6)
 
     d["Antal aktier"] = pd.to_numeric(d["Antal aktier"], errors="coerce").fillna(0.0)
@@ -422,11 +468,11 @@ def beräkna(df: pd.DataFrame) -> pd.DataFrame:
         return pay_date.strftime("%Y-%m-%d")
 
     d["Nästa utbetalning (est)"] = [
-        next_pay(d.at[i,"Ex-Date"], d.at[i,"Frekvens/år"], d.at[i,"Payment-lag (dagar)"]) for i in d.index
+        next_pay(d.at[i,"Ex-Date"], d.at[i, "Frekvens/år"], d.at[i,"Payment-lag (dagar)"]) for i in d.index
     ]
     return d
 
-# ── Prognos
+# ── Prognos ────────────────────────────────────────────────────────────────
 def _gen_payment_dates(first_ex_date: str, freq_per_year: float, payment_lag_days: float, months_ahead: int = 12):
     ts = pd.to_datetime(first_ex_date, errors="coerce")
     if pd.isna(ts): return []
@@ -455,7 +501,7 @@ def prognos_kalender(df: pd.DataFrame, months_ahead: int = 12):
         try:
             per_share_local = float(r.get("Utdelning/år_eff", 0.0)) / max(1.0, float(r.get("Frekvens/år", 4.0)))
             qty = float(r.get("Antal aktier", 0.0))
-            fx = fx_for(r.get("Valuta", "SEK"))
+            fx = fx_for(r.get("Valuta","SEK"), r.get("Ticker",""))
             per_payment_sek = per_share_local * fx * qty
             if per_payment_sek <= 0: continue
             pays = _gen_payment_dates(r.get("Ex-Date",""), r.get("Frekvens/år",4), r.get("Payment-lag (dagar)",30), months_ahead)
@@ -471,7 +517,7 @@ def prognos_kalender(df: pd.DataFrame, months_ahead: int = 12):
     monthly = monthly.sort_values("Månad")
     return monthly, cal
 
-# ── Mass‑refresh helper
+# ── Mass‑refresh helper ────────────────────────────────────────────────────
 def refresh_all_from_yahoo(df: pd.DataFrame, sleep_s: float = 1.0, show_progress: bool = True) -> pd.DataFrame:
     d = säkerställ_kolumner(df).copy()
     if d.empty: return d
@@ -486,7 +532,7 @@ def refresh_all_from_yahoo(df: pd.DataFrame, sleep_s: float = 1.0, show_progress
         if vals:
             if vals.get("namn"):  d.loc[m, "Bolagsnamn"] = vals["namn"]
             if vals.get("kurs") is not None: d.loc[m, "Aktuell kurs"] = vals["kurs"]
-            if vals.get("valuta"): d.loc[m, "Valuta"] = vals["valuta"]
+            if vals.get("valuta"): d.loc[m, "Valuta"] = vals["valuta"]  # skriv inte över med tom
             locked = bool(d.loc[m, "Lås utdelning"].iloc[0]) if m.any() else False
             if not locked:
                 new_div = float(vals.get("utdelning") or 0.0)
@@ -505,7 +551,7 @@ def refresh_all_from_yahoo(df: pd.DataFrame, sleep_s: float = 1.0, show_progress
         time.sleep(sleep_s)
     return beräkna(d)
 
-# ── Lägg till / Uppdatera
+# ── Lägg till / Uppdatera ──────────────────────────────────────────────────
 def lagg_till_eller_uppdatera(df: pd.DataFrame) -> pd.DataFrame:
     st.subheader("➕ Lägg till / ✏︎ Uppdatera bolag")
     d = säkerställ_kolumner(df).copy()
@@ -634,7 +680,7 @@ def page_mass_update(df: pd.DataFrame) -> pd.DataFrame:
         st.success("Klart! Glöm inte att spara till Google Sheets om du vill skriva tillbaka.")
     return st.session_state.get("working_df", d)
 
-# ── Enkel portföljvy
+# ── Enkel portföljvy ───────────────────────────────────────────────────────
 def portfolj_oversikt(df: pd.DataFrame) -> pd.DataFrame:
     st.subheader("📦 Portföljöversikt")
     d = beräkna(df).copy()
@@ -650,7 +696,7 @@ def portfolj_oversikt(df: pd.DataFrame) -> pd.DataFrame:
     st.dataframe(d[["Ticker","Bolagsnamn","Valuta","Kategori","Antal aktier","GAV","Kurs (SEK)","Marknadsvärde (SEK)","Direktavkastning (%)","Årlig utdelning (SEK)","Ex-Date","Nästa utbetalning (est)"]], use_container_width=True)
     return d
 
-# ── Settings-sida (mål)
+# ── Settings-sida (mål) ───────────────────────────────────────────────────
 def page_settings_distribution(df: pd.DataFrame):
     st.subheader("⚖️ Mål & fördelning per kategori")
     targets, ignore_empty = load_settings()
@@ -672,7 +718,7 @@ def page_settings_distribution(df: pd.DataFrame):
         total = sum(edits.values())
         st.metric("Summa angivna mål (%)", f"{total:.1f}")
 
-# ── Avgifter (mini)
+# ── Avgifter ───────────────────────────────────────────────────────────────
 MIN_COURTAGE_RATE = 0.0025
 MIN_COURTAGE_SEK  = 1.0
 FX_FEE_RATE       = 0.0025
@@ -684,7 +730,7 @@ def calc_fees(order_value_sek: float, foreign: bool):
     total    = round(courtage + fx_fee, 2)
     return round(courtage,2), round(fx_fee,2), total
 
-# ── Köpförslag (mål + ignorera tomma kategorier)
+# ── Köpförslag ─────────────────────────────────────────────────────────────
 def suggest_buys(df: pd.DataFrame, cash_sek: float, w_val: float=0.5, w_cat: float=0.35, w_time: float=0.15, topk: int=5) -> pd.DataFrame:
     d = beräkna(df).copy()
     if d.empty or cash_sek <= 0:
@@ -717,7 +763,7 @@ def suggest_buys(df: pd.DataFrame, cash_sek: float, w_val: float=0.5, w_cat: flo
 
         m = GLOBAL_MAX_NAME/100.0
         if (Vi + price) / (T + price) > m:
-            diags.append((r["Ticker"], "1 st skulle överskrida bolagstak 12.0%")); continue
+            diags.append((r["Ticker"], f"1 st skulle överskrida bolagstak {GLOBAL_MAX_NAME:.1f}%")); continue
         M = get_cat_max(cat)/100.0
         if (C + price) / (T + price) > M:
             diags.append((r["Ticker"], f"1 st skulle överskrida kategori-tak {get_cat_max(cat):.1f}%")); continue
@@ -797,7 +843,7 @@ def suggest_buys(df: pd.DataFrame, cash_sek: float, w_val: float=0.5, w_cat: flo
     cols = ["Ticker","Kategori","Poäng","DA %","Vikt %","Nästa utb","Föreslagna st","Kostnad ca","Motivering"]
     return pd.DataFrame(rows)[cols] if rows else pd.DataFrame(columns=cols)
 
-# ── Köpförslag‑UI + “Använd köpplanen”
+# ── Köpförslag‑UI + “Använd köpplanen” ────────────────────────────────────
 def page_buy_suggestions(df: pd.DataFrame):
     st.subheader("🎯 Köpförslag (målvikter & tak beaktas)")
     c1, c2, c3, c4 = st.columns(4)
@@ -818,25 +864,21 @@ def page_buy_suggestions(df: pd.DataFrame):
             st.dataframe(sug, use_container_width=True)
             st.caption("Poäng = DA + kategori-gap + hur nära nästa utdelning.")
 
-            # ——— Använd köpplanen direkt (in‑memory) ———
             apply_now = st.checkbox("Använd köpplanen direkt (in‑memory)")
             if apply_now and st.button("🚀 Genomför föreslagna köp i minnet"):
                 base = säkerställ_kolumner(st.session_state.get("working_df", df)).copy()
                 if "pending_txs" not in st.session_state:
                     st.session_state["pending_txs"] = []
                 for _, row in sug.iterrows():
-                    tkr = str(row["Ticker"])
-                    n   = int(row["Föreslagna st"])
-                    if n <= 0: 
-                        continue
+                    tkr = str(row["Ticker"]); n = int(row["Föreslagna st"])
+                    if n <= 0: continue
                     m = base["Ticker"].astype(str) == tkr
                     if not m.any():
-                        st.warning(f"{tkr} finns inte i tabellen – hoppar över.")
-                        continue
+                        st.warning(f"{tkr} finns inte i tabellen – hoppar över."); continue
 
                     px_local = float(pd.to_numeric(base.loc[m, "Aktuell kurs"], errors="coerce").fillna(0.0).iloc[0])
-                    ccy      = str(base.loc[m, "Valuta"].iloc[0]).upper() or "SEK"
-                    fx       = fx_for(ccy)
+                    ccy      = str(base.loc[m, "Valuta"].iloc[0]).upper() or infer_currency_from_ticker(tkr) or "SEK"
+                    fx       = fx_for(ccy, tkr)
                     px_sek   = round(px_local * fx, 6)
                     gross    = round(px_sek * n, 2)
                     foreign  = (ccy != "SEK")
@@ -863,7 +905,7 @@ def page_buy_suggestions(df: pd.DataFrame):
                 st.success("Köpplanen är inlagd i minnet. Gå till “💾 Spara” om du vill skriva till Google Sheets.")
                 _rerun()
 
-# ── Kalender-sida
+# ── Kalender-sida ─────────────────────────────────────────────────────────
 def page_calendar(df: pd.DataFrame):
     st.subheader("📅 Utdelningskalender")
     months = st.selectbox("Prognoshorisont", options=[12, 24, 36], index=0)
@@ -877,7 +919,7 @@ def page_calendar(df: pd.DataFrame):
         with st.expander("Detaljerade kommande betalningar per ticker"):
             st.dataframe(cal.sort_values("Datum"), use_container_width=True)
 
-# ── Spara-sida
+# ── Spara-sida ─────────────────────────────────────────────────────────────
 def page_save_now(df: pd.DataFrame):
     st.subheader("💾 Spara till Google Sheets")
     preview = beräkna( säkerställ_kolumner(df) )
@@ -904,43 +946,66 @@ def page_save_now(df: pd.DataFrame):
         st.success("Data sparad!")
     return preview
 
-# ── Sidopanel
+# ── Sidopanel ──────────────────────────────────────────────────────────────
 def sidopanel():
     st.sidebar.header("⚙️ Inställningar")
     st.sidebar.markdown("**Växelkurser (SEK)**")
-    colA, colB = st.sidebar.columns(2)
+    colA, colB, colC = st.sidebar.columns(3)
     with colA:
         usd = st.number_input("USD/SEK", min_value=0.0, value=float(st.session_state["USDSEK"]), step=0.01, format="%.4f")
-        eur = st.number_input("EUR/SEK", min_value=0.0, value=float(st.session_state["EURSEK"]), step=0.01, format="%.4f")
     with colB:
+        eur = st.number_input("EUR/SEK", min_value=0.0, value=float(st.session_state["EURSEK"]), step=0.01, format="%.4f")
+    with colC:
+        gbp = st.number_input("GBP/SEK", min_value=0.0, value=float(st.session_state["GBPSEK"]), step=0.01, format="%.4f")
+    colD, colE = st.sidebar.columns(2)
+    with colD:
         cad = st.number_input("CAD/SEK", min_value=0.0, value=float(st.session_state["CADSEK"]), step=0.01, format="%.4f")
+    with colE:
         nok = st.number_input("NOK/SEK", min_value=0.0, value=float(st.session_state["NOKSEK"]), step=0.01, format="%.4f")
-    st.session_state["USDSEK"], st.session_state["EURSEK"], st.session_state["CADSEK"], st.session_state["NOKSEK"] = usd, eur, cad, nok
+    st.session_state["USDSEK"], st.session_state["EURSEK"], st.session_state["GBPSEK"], st.session_state["CADSEK"], st.session_state["NOKSEK"] = usd, eur, gbp, cad, nok
 
     if st.sidebar.button("↩︎ Återställ FX till standard"):
         for k, v in DEF.items(): st.session_state[k] = v
         _rerun()
 
     st.sidebar.markdown("---")
+    auto_mu = st.sidebar.checkbox("Uppdatera från Yahoo direkt efter inläsning", value=True, help="Kör massuppdatering automatiskt när du laddat in Google Sheets.")
+
     if st.sidebar.button("🔌 Ladda data från Google Sheets NU"):
         with st.sidebar:
-            with st.spinner("Hämtar data från Google Sheets…"):
+            with st.spinner("Läser Google Sheets…"):
                 try:
                     loaded = migrate_sheet_columns()
-                    st.session_state["working_df"] = säkerställ_kolumner(loaded)
-                    st.success("Data inläst!"); _rerun()
+                    base = säkerställ_kolumner(loaded)
+                    st.session_state["working_df"] = base
+                    st.success("Data inläst!")
                 except Exception as e:
                     st.error("Kunde inte läsa från Google Sheets."); st.caption(e)
+                    base = säkerställ_kolumner(pd.DataFrame())
 
-    st.sidebar.markdown("---")
-    one = st.sidebar.text_input("Uppdatera EN ticker (Yahoo)", placeholder="t.ex. VICI").strip().upper()
-    if st.sidebar.button("🔄 Uppdatera EN NU"):
-        if one:
-            base = säkerställ_kolumner(st.session_state.get("working_df", pd.DataFrame()))
-            if one not in base["Ticker"].tolist():
-                base = pd.concat([base, pd.DataFrame([{"Ticker": one, "Kategori": "QUALITY"}])], ignore_index=True)
-            st.session_state["working_df"] = page_update_single(base)
-            st.sidebar.success(f"{one} uppdaterad (in‑memory).")
+            if auto_mu and not base.empty:
+                with st.spinner("Massuppdaterar från Yahoo…"):
+                    base2 = refresh_all_from_yahoo(base, sleep_s=1.0, show_progress=True)
+                    st.session_state["working_df"] = base2
+                    st.success("Massuppdatering klar.")
+                    _rerun()
+
+    if st.sidebar.button("⚡ Ladda + Massuppdatera (1 klick)"):
+        with st.sidebar:
+            with st.spinner("Läser Google Sheets…"):
+                try:
+                    loaded = migrate_sheet_columns()
+                    base = säkerställ_kolumner(loaded)
+                    st.session_state["working_df"] = base
+                except Exception as e:
+                    st.error("Kunde inte läsa från Google Sheets."); st.caption(e)
+                    base = säkerställ_kolumner(pd.DataFrame())
+            if not base.empty:
+                with st.spinner("Massuppdaterar från Yahoo…"):
+                    base2 = refresh_all_from_yahoo(base, sleep_s=1.0, show_progress=True)
+                    st.session_state["working_df"] = base2
+                    st.success("Klar!")
+                    _rerun()
 
     st.sidebar.markdown("---")
     clear_ok = st.sidebar.checkbox("Bekräfta rensning (återställ till Google Sheets)")
@@ -952,19 +1017,39 @@ def sidopanel():
         else:
             st.sidebar.warning("Bocka i bekräftelsen först.")
 
-# ── Main
+# ── Main ───────────────────────────────────────────────────────────────────
 def main():
     st.title("Relative Yield – utdelningsportfölj")
 
-    # Starta utan att läsa Sheets (on‑demand i sidopanelen)
+    # Auto-load från Google Sheets vid start, och auto-massupdate om det behövs
     if "working_df" not in st.session_state:
-        st.session_state["working_df"] = säkerställ_kolumner(pd.DataFrame())
+        try:
+            st.session_state["working_df"] = migrate_sheet_columns()
+        except Exception:
+            st.session_state["working_df"] = säkerställ_kolumner(pd.DataFrame())
+
+        # Direkt efter inläsning: om datan ser “fel” ut → uppdatera tyst
+        base0 = säkerställ_kolumner(st.session_state["working_df"])
+        try:
+            if needs_refresh(base0) and not base0.empty:
+                base0 = refresh_all_from_yahoo(base0, sleep_s=1.0, show_progress=False)
+                st.session_state["working_df"] = base0
+        except Exception:
+            pass
+
     base = säkerställ_kolumner(st.session_state["working_df"])
+
+    # Banderoll om datan ser ofullständig ut
+    try:
+        if needs_refresh(base):
+            st.warning("🔄 Datan verkar vara inaktuell eller ofullständig. Kör **'⚡ Ladda + Massuppdatera'** i sidopanelen för att nollställa konstiga värden.")
+    except Exception:
+        pass
 
     sidopanel()
     st.sidebar.caption(f"📄 Rader i databasen: {len(base)}")
     if base.empty:
-        st.info("Ingen data inläst än. Använd sidopanelen: **🔌 Ladda data från Google Sheets NU**.")
+        st.info("Ingen data inläst än. Använd sidopanelen: **⚡ Ladda + Massuppdatera** eller **🔌 Ladda data**.")
 
     page = st.sidebar.radio(
         "Meny",
