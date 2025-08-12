@@ -110,56 +110,115 @@ def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
         d["Utdelningskälla"] = "Yahoo"
     return d[COLUMNS].copy()
 
-# ── Spara/Läsa till Sheets (med formatering) ──────────────────────────────
-def spara_data(df: pd.DataFrame):
+# ── Spara/Läsa till Sheets (SÄKERT läge) ──────────────────────────────────
+def spara_data_safe(df: pd.DataFrame, max_retries: int = 3):
     ws = skapa_koppling()
     out = säkerställ_kolumner(df).copy()
 
+    # 1) Skydda mot tom sparning
+    if out.empty or out["Ticker"].astype(str).str.strip().eq("").all():
+        st.error("Sparning avbruten: tom data eller inga tickers.")
+        return
+
+    # 2) Backup av nuvarande blad innan skrivning
+    try:
+        sh = _open_sheet()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_title = f"_Backup_{timestamp}"
+        backup_ws = sh.add_worksheet(title=backup_title, rows=1, cols=max(1, len(out.columns)))
+        try:
+            cur_rows = ws.get_all_values()
+        except Exception:
+            cur_rows = []
+        if cur_rows:
+            backup_ws.update(cur_rows, value_input_option="RAW")
+    except Exception as e:
+        st.warning(f"Kunde inte skapa backupflik (fortsätter ändå): {e}")
+
+    # 3) Säkerställ numeriska kolumner
     numeric_cols = ["Aktuell kurs","Utdelning/år","Utdelning/år (manuell)","Frekvens/år","Payment-lag (dagar)",
                     "Antal aktier","GAV","Kurs (SEK)","Marknadsvärde (SEK)","Portföljandel (%)",
                     "Insatt (SEK)","Årlig utdelning (SEK)","Direktavkastning (%)"]
     for c in numeric_cols:
         out[c] = out[c].apply(_to_float)
 
-    ws.clear()
-    ws.update([out.columns.tolist()] + out.values.tolist(), value_input_option="RAW")
+    header = [out.columns.tolist()]
+    body   = out.values.tolist()
 
-    # Lås number/date-format
-    nrows = max(1, len(out)+1)
-    def col_idx(name): 
-        try: return list(out.columns).index(name)
-        except ValueError: return None
-    requests = []
-    for name in numeric_cols:
-        idx = col_idx(name)
-        if idx is None: continue
-        requests.append({
-            "repeatCell": {
-                "range": {"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": nrows,
-                          "startColumnIndex": idx, "endColumnIndex": idx+1},
-                "cell": {"userEnteredFormat": {"numberFormat": {"type":"NUMBER","pattern":"0.00########"}}},
-                "fields": "userEnteredFormat.numberFormat"
-            }
-        })
-    for date_col in ["Ex-Date","Nästa utbetalning (est)","Senaste uppdatering"]:
-        idx = col_idx(date_col)
-        if idx is None: continue
-        requests.append({
-            "repeatCell": {
-                "range": {"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": nrows,
-                          "startColumnIndex": idx, "endColumnIndex": idx+1},
-                "cell": {"userEnteredFormat": {"numberFormat": {"type":"DATE","pattern":"yyyy-mm-dd"}}},
-                "fields": "userEnteredFormat.numberFormat"
-            }
-        })
-    if requests:
-        ws.spreadsheet.batch_update({"requests": requests})
+    # 4) Skriv FÖRST (utan clear) med retry/backoff vid 429
+    for attempt in range(1, max_retries+1):
+        try:
+            ws.update(header + body, value_input_option="RAW")
+            break
+        except Exception as e:
+            msg = str(e)
+            if ("Quota exceeded" in msg or "429" in msg) and attempt < max_retries:
+                time.sleep(2 * attempt)  # enkel backoff
+                continue
+            st.error(f"Sparfel (avbryter, ingen clear gjord): {e}")
+            return
+
+    # 5) Rensa bara överflödiga rader (om ny data är kortare)
+    try:
+        old = ws.get_all_values()
+        new_rows = len(header + body)
+        if len(old) > new_rows and old:
+            start_row = new_rows + 1
+            end_row   = len(old)
+            start_col = 1
+            end_col   = len(old[0])
+            ws.batch_clear([
+                f"{gspread.utils.rowcol_to_a1(start_row, start_col)}:"
+                f"{gspread.utils.rowcol_to_a1(end_row, end_col)}"
+            ])
+    except Exception as e:
+        st.warning(f"Kunde inte rensa överflödiga rader (inte kritiskt): {e}")
+
+    # 6) Sätt tal- och datumformat efter lyckad skrivning
+    try:
+        nrows = max(1, len(out)+1)
+        def col_idx(name):
+            try: return list(out.columns).index(name)
+            except ValueError: return None
+        requests = []
+        for name in numeric_cols:
+            idx = col_idx(name)
+            if idx is None: continue
+            requests.append({
+                "repeatCell": {
+                    "range": {"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": nrows,
+                              "startColumnIndex": idx, "endColumnIndex": idx+1},
+                    "cell": {"userEnteredFormat": {"numberFormat": {"type":"NUMBER","pattern":"0.00########"}}},
+                    "fields": "userEnteredFormat.numberFormat"
+                }
+            })
+        for date_col in ["Ex-Date","Nästa utbetalning (est)","Senaste uppdatering"]:
+            idx = col_idx(date_col)
+            if idx is None: continue
+            requests.append({
+                "repeatCell": {
+                    "range": {"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": nrows,
+                              "startColumnIndex": idx, "endColumnIndex": idx+1},
+                    "cell": {"userEnteredFormat": {"numberFormat": {"type":"DATE","pattern":"yyyy-mm-dd"}}},
+                    "fields": "userEnteredFormat.numberFormat"
+                }
+            })
+        if requests:
+            ws.spreadsheet.batch_update({"requests": requests})
+    except Exception as e:
+        st.warning(f"Kunde inte sätta format: {e}")
+
+    st.success("✅ Sparning klar (säkert läge).")
+
+# 🔄 Alias – alla befintliga spara_data-anrop funkar oförändrat
+spara_data = spara_data_safe
 
 def hamta_data():
     try:
         ws = skapa_koppling()
         rows = ws.get_all_records()
-        return säkerställ_kolumner(pd.DataFrame(rows))
+        df = pd.DataFrame(rows)
+        return säkerställ_kolumner(df)
     except Exception as e:
         st.warning(f"Kunde inte läsa Google Sheet: {e}")
         return säkerställ_kolumner(pd.DataFrame())
@@ -214,21 +273,25 @@ def fetch_yahoo(ticker: str) -> dict:
         _throttle(1.0)
         t = ticker.strip().upper()
         yf_ticker = yf.Ticker(t)
-        info = yf_ticker.info
-        hist_divs = yf_ticker.dividends
+        info = yf_ticker.info if hasattr(yf_ticker, "info") else {}
+        hist_divs = getattr(yf_ticker, "dividends", pd.Series(dtype=float))
+
         ex_date = None
-        if not hist_divs.empty:
+        if hist_divs is not None and not hist_divs.empty:
             ex_date = hist_divs.index[-1].strftime("%Y-%m-%d")
+
+        # Summera senaste 12 mån utdelningar
         div_year = 0.0
         freq = 0
-        if not hist_divs.empty:
-            divs = hist_divs.tail(4)
-            div_year = float(divs.sum())
-            freq = len(divs)
+        if hist_divs is not None and not hist_divs.empty:
+            last12 = hist_divs[hist_divs.index >= (pd.Timestamp.utcnow() - pd.Timedelta(days=365))]
+            div_year = float((last12.tail(12)).sum())
+            freq = int(last12.shape[0])
+
         return {
             "Aktuell kurs": _to_float(info.get("currentPrice", 0)),
             "Valuta": info.get("currency", "USD"),
-            "Bolagsnamn": info.get("shortName", ""),
+            "Bolagsnamn": info.get("shortName", t),
             "Utdelning/år": div_year,
             "Frekvens/år": freq,
             "Ex-Date": ex_date,
@@ -240,20 +303,32 @@ def fetch_yahoo(ticker: str) -> dict:
 
 # ── Beräkningar ───────────────────────────────────────────────────────────
 def beräkna_allt(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
-    tot_mv = 0.0
-    d["Kurs (SEK)"] = d.apply(lambda r: _to_float(r["Aktuell kurs"]) * fx_for(r["Valuta"]), axis=1)
-    d["Marknadsvärde (SEK)"] = d["Kurs (SEK)"] * d["Antal aktier"]
-    tot_mv = d["Marknadsvärde (SEK)"].sum()
-    d["Portföljandel (%)"] = d["Marknadsvärde (SEK)"].apply(lambda v: (v / tot_mv * 100) if tot_mv > 0 else 0)
-    d["Insatt (SEK)"] = d["Antal aktier"] * d["GAV"] * d.apply(lambda r: fx_for(r["Valuta"]), axis=1)
-    d["Årlig utdelning (SEK)"] = d.apply(lambda r: (
-        _to_float(r["Utdelning/år (manuell)"]) if r.get("Lås utdelning") else _to_float(r["Utdelning/år"])
-    ) * fx_for(r["Valuta"]) * _to_float(r["Antal aktier"]), axis=1)
-    d["Direktavkastning (%)"] = d.apply(lambda r: (
-        (_to_float(r["Utdelning/år (manuell)"]) if r.get("Lås utdelning") else _to_float(r["Utdelning/år"])) /
-        _to_float(r["Aktuell kurs"]) * 100 if _to_float(r["Aktuell kurs"]) > 0 else 0
-    ), axis=1)
+    d = säkerställ_kolumner(df).copy()
+
+    # Val av utdelningskälla
+    d["Utdelning/år_eff"] = d.apply(
+        lambda r: _to_float(r["Utdelning/år (manuell)"]) if bool(r.get("Lås utdelning")) and _to_float(r["Utdelning/år (manuell)"])>0
+        else _to_float(r["Utdelning/år"]), axis=1
+    )
+    d["Utdelningskälla"] = d.apply(
+        lambda r: "Manuell 🔒" if bool(r.get("Lås utdelning")) and _to_float(r["Utdelning/år (manuell)"])>0 else "Yahoo", axis=1
+    )
+
+    # Kurs i SEK
+    d["Kurs (SEK)"] = (d["Aktuell kurs"].apply(_to_float) * d["Valuta"].map(fx_for)).round(6)
+
+    # Marknadsvärde och andel
+    d["Marknadsvärde (SEK)"] = (d["Antal aktier"].apply(_to_float) * d["Kurs (SEK)"]).round(2)
+    tot_mv = float(d["Marknadsvärde (SEK)"].sum()) or 1.0
+    d["Portföljandel (%)"] = (100.0 * d["Marknadsvärde (SEK)"] / tot_mv).round(2)
+
+    # Insatt i SEK (GAV i lokal * qty * FX)
+    d["Insatt (SEK)"] = (d["Antal aktier"].apply(_to_float) * d["GAV"].apply(_to_float) * d["Valuta"].map(fx_for)).round(2)
+
+    # Utdelning i SEK & DA
+    d["Årlig utdelning (SEK)"] = (d["Antal aktier"].apply(_to_float) * d["Utdelning/år_eff"].apply(_to_float) * d["Valuta"].map(fx_for)).round(2)
+    d["Direktavkastning (%)"] = d.apply(lambda r: (100.0 * _to_float(r["Utdelning/år_eff"]) / _to_float(r["Aktuell kurs"])) if _to_float(r["Aktuell kurs"])>0 else 0.0, axis=1).round(2)
+
     return d
 
 # ── Nästa utdelning (estimerad) ───────────────────────────────────────────
@@ -266,8 +341,14 @@ def nästa_utd_datum(row):
         if not exdate_str or exdate_str.lower() == "nan":
             return ""
         exdate = datetime.strptime(exdate_str, "%Y-%m-%d").date()
-        pay_lag = int(_to_float(row.get("Payment-lag (dagar)", 0)))
-        return (exdate + timedelta(days=pay_lag)).strftime("%Y-%m-%d")
+        pay_lag = int(_to_float(row.get("Payment-lag (dagar)", 30)))
+        # approximera nästa ex-date framåt
+        step_days = max(1, int(round(365.0 / max(freq,1))))
+        today_d = date.today()
+        while exdate < today_d:
+            exdate = exdate + timedelta(days=step_days)
+        pay_date = exdate + timedelta(days=pay_lag)
+        return pay_date.strftime("%Y-%m-%d")
     except Exception:
         return ""
 
@@ -503,7 +584,7 @@ def _cap_shares_limit(current_value, total_value, px, limit_pct):
 
 def page_buy_planner(df: pd.DataFrame):
     st.subheader("🎯 Köpförslag & plan (≈500 kr per köp)")
-    base = beräkna_allt(df).copy()
+    base = uppdatera_nästa_utd(beräkna_allt(df).copy())
 
     gmax, cat_targets = load_settings()
     present_cats = set(base["Kategori"].astype(str).unique().tolist())
@@ -523,7 +604,6 @@ def page_buy_planner(df: pd.DataFrame):
         da_score = (min(max(da,0),15)/15.0)*100.0
         under = max(0.0, gmax_ui - float(_to_float(r["Portföljandel (%)"])))
         under_score = (under/max(gmax_ui,1e-9))*100.0
-        # närmast nästa utbetalning (est) → bättre poäng
         dt = pd.to_datetime(r.get("Nästa utbetalning (est)",""), errors="coerce")
         days = 9999 if pd.isna(dt) else max(0,(dt.date()-date.today()).days)
         time_score = ((90 - min(days,90))/90.0)*100.0
@@ -591,7 +671,6 @@ def page_buy_planner(df: pd.DataFrame):
     st.write("**Summering per ticker:**")
     st.dataframe(per_ticker, use_container_width=True)
 
-    # spara i session för ev. loggning
     st.session_state["buy_plan_rows"] = plan.to_dict("records")
     if st.button("📝 Spara planen som transaktionslogg (utan att ändra innehav)"):
         rows = []
@@ -603,8 +682,7 @@ def page_buy_planner(df: pd.DataFrame):
 # ── Portfölj ──────────────────────────────────────────────────────────────
 def page_portfolio(df: pd.DataFrame):
     st.subheader("📦 Portföljöversikt")
-    d = beräkna_allt(df).copy()
-    d = uppdatera_nästa_utd(d)
+    d = uppdatera_nästa_utd(beräkna_allt(df).copy())
     if d.empty:
         st.info("Lägg till minst ett bolag.")
         return
@@ -630,7 +708,6 @@ def page_calendar(df: pd.DataFrame):
     st.subheader("📅 Utdelningskalender")
     months = st.selectbox("Prognoshorisont (mån)", options=[12,24,36], index=0)
 
-    # enkel prognos: använd Frekvens/år + Ex-Date + Payment-lag (om satt)
     def _gen(first_date, freq, lag, months_ahead):
         ts = pd.to_datetime(first_date, errors="coerce")
         if pd.isna(ts): return []
@@ -678,7 +755,10 @@ def page_save(df: pd.DataFrame):
     st.subheader("💾 Spara nu till Google Sheets")
     preview = uppdatera_nästa_utd(beräkna_allt(säkerställ_kolumner(df)))
     st.write("Rader som sparas:", len(preview))
-    st.dataframe(preview[["Ticker","Bolagsnamn","Valuta","Kategori","Antal aktier","GAV","Aktuell kurs","Utdelning/år","Kurs (SEK)","Årlig utdelning (SEK)"]], use_container_width=True)
+    st.dataframe(
+        preview[["Ticker","Bolagsnamn","Valuta","Kategori","Antal aktier","GAV","Aktuell kurs","Utdelning/år","Kurs (SEK)","Årlig utdelning (SEK)"]],
+        use_container_width=True
+    )
     if st.button("✅ Bekräfta och spara"):
         spara_data(preview)
         st.success("Sparat.")
@@ -720,7 +800,7 @@ def main():
 
     elif page == "⚖️ Regler & mål":
         # Läs nuvarande settings så UI visar rätt värden
-        gmax, cats = load_settings()
+        _ = load_settings()
         page_settings(base)
 
     elif page == "➕ Lägg till / ✏ Uppdatera bolag":
