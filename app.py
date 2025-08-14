@@ -558,6 +558,32 @@ def page_settings(df: pd.DataFrame):
         save_settings(gmax_new, new_cats)
         st.success("Regler sparade till Settings.")
 
+    # ── NYTT: Sammanställning av nuvarande portfölj (kategori & bolag) ──
+    st.markdown("---")
+    st.markdown("### 📊 Portföljfördelning just nu")
+    cur = beräkna_allt(df).copy()
+    cur["Marknadsvärde (SEK)"] = pd.to_numeric(cur["Marknadsvärde (SEK)"], errors="coerce").fillna(0.0)
+    cur["Portföljandel (%)"]   = pd.to_numeric(cur["Portföljandel (%)"], errors="coerce").fillna(0.0)
+
+    total_mv = float(cur["Marknadsvärde (SEK)"].sum())
+    if total_mv > 0:
+        cat_now = (cur.groupby("Kategori", as_index=False)["Marknadsvärde (SEK)"]
+                     .sum()
+                     .rename(columns={"Marknadsvärde (SEK)":"Summa (SEK)"}))
+        cat_now["Andel (%)"] = (100.0 * cat_now["Summa (SEK)"] / total_mv).round(2)
+        st.write("**Andel per kategori:**")
+        st.dataframe(cat_now.sort_values("Andel (%)", ascending=False), use_container_width=True)
+
+        st.write("**Bolag per kategori (andel av portfölj):**")
+        for cat in cat_now.sort_values("Andel (%)", ascending=False)["Kategori"]:
+            sub = cur[cur["Kategori"] == cat][["Ticker","Bolagsnamn","Marknadsvärde (SEK)","Portföljandel (%)"]].copy()
+            if sub.empty: 
+                continue
+            with st.expander(f"{cat} — {float(cat_now[cat_now['Kategori']==cat]['Andel (%)'].iloc[0]):.2f}% av portföljen"):
+                st.dataframe(sub.sort_values("Portföljandel (%)", ascending=False), use_container_width=True)
+    else:
+        st.info("Portföljen saknar marknadsvärden just nu.")
+
 # ── Lägg till / uppdatera bolag (in-memory; spara via ”Spara”-sidan) ─────
 CATEGORY_CHOICES = ["QUALITY","REIT","mREIT","BDC","Shipping","Telecom","Tech","Bank","Finance","Energy","Industrial","Other"]
 
@@ -764,10 +790,18 @@ def page_buy_planner(df: pd.DataFrame):
 # ── Portfölj ──────────────────────────────────────────────────────────────
 def page_portfolio(df: pd.DataFrame):
     st.subheader("📦 Portföljöversikt")
+
+    # Arbeta alltid på en kopia & robust typning
     d = uppdatera_nästa_utd(beräkna_allt(df).copy())
     if d.empty:
         st.info("Lägg till minst ett bolag.")
         return
+
+    # Säker numerik
+    for col in ["Marknadsvärde (SEK)","Insatt (SEK)","Årlig utdelning (SEK)","Antal aktier","GAV","Aktuell kurs","Kurs (SEK)","Portföljandel (%)","Utdelning/år"]:
+        if col in d.columns:
+            d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0.0)
+
     tot_mv  = float(d["Marknadsvärde (SEK)"].sum())
     tot_ins = float(d["Insatt (SEK)"].sum())
     tot_div = float(d["Årlig utdelning (SEK)"].sum())
@@ -782,7 +816,19 @@ def page_portfolio(df: pd.DataFrame):
         "Aktuell kurs","Kurs (SEK)","Marknadsvärde (SEK)","Portföljandel (%)",
         "Utdelning/år","Årlig utdelning (SEK)","Frekvens/år","Ex-Date","Nästa utbetalning (est)"
     ]
-    st.dataframe(d[show_cols], use_container_width=True)
+    view = d[show_cols].copy()
+    # sista säkerställande av numerik i vyn
+    for col in ["Antal aktier","GAV","Aktuell kurs","Kurs (SEK)","Marknadsvärde (SEK)","Portföljandel (%)","Utdelning/år","Årlig utdelning (SEK)"]:
+        view[col] = pd.to_numeric(view[col], errors="coerce").fillna(0.0)
+
+    st.dataframe(view, use_container_width=True)
+
+    # Liten felsökare
+    with st.expander("🔎 Felsök en ticker (råvärden från minnet)"):
+        tlist = d["Ticker"].dropna().astype(str).unique().tolist()
+        if tlist:
+            tsel = st.selectbox("Ticker", tlist)
+            st.write(d[d["Ticker"]==tsel].T)
 
 # ── Kalender ──────────────────────────────────────────────────────────────
 def page_calendar(df: pd.DataFrame):
