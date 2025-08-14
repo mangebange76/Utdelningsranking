@@ -44,11 +44,32 @@ def skapa_koppling():
         ws.update([["Ticker"]], value_input_option="RAW")
         return ws
 
-# Liten helper för Spreadsheet-objekt (används vid export av TrimCandidates)
 def skapa_koppling_google_sheet():
     return _open_sheet()
 
-# ── Robust talparser (hindrar “tid” osv) ───────────────────────────────────
+# ── Rätta Google Sheet (formatering → TEXT) ───────────────────────────────
+def ratta_sheet_format(sheet_name=SHEET_NAME):
+    try:
+        sh = _open_sheet()
+        ws = sh.worksheet(sheet_name)
+        sheet_id = ws._properties["sheetId"]
+        body = {
+            "requests": [
+                {
+                    "repeatCell": {
+                        "range": {"sheetId": sheet_id},
+                        "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}},
+                        "fields": "userEnteredFormat.numberFormat"
+                    }
+                }
+            ]
+        }
+        sh.batch_update(body)
+        return True, "Formatering satt till TEXT för hela bladet."
+    except Exception as e:
+        return False, f"Kunde inte rätta format: {e}"
+
+# ── Robust talparser (hindrar tid/%/datum) ────────────────────────────────
 def _to_float(x):
     if pd.isna(x): return 0.0
     s = str(x).strip()
@@ -84,7 +105,7 @@ COLUMNS = [
     "Ticker","Bolagsnamn","Aktuell kurs","Valuta","Kategori",
     "Direktavkastning (%)","Utdelning/år","Utdelning/år (manuell)","Lås utdelning",
     "Frekvens/år","Utdelningsfrekvens","Payment-lag (dagar)","Ex-Date","Nästa utbetalning (est)",
-    "Antal aktier","GAV",                       # GAV i lokal valuta
+    "Antal aktier","GAV",  # GAV i lokal valuta
     "Kurs (SEK)","Marknadsvärde (SEK)","Portföljandel (%)",
     "Insatt (SEK)","Årlig utdelning (SEK)","Utdelningstillväxt (%)",
     "Utdelningskälla","Senaste uppdatering","Källa"
@@ -185,7 +206,7 @@ def autosnap_now():
         if cur:
             backup_ws.update(cur, value_input_option="RAW")
         # trimma äldre backups (behåll 10 senaste)
-        titles = sorted(_list_backup_titles(sh))  # lexikum funkar med tidsstämpel
+        titles = sorted(_list_backup_titles(sh))
         if len(titles) > 10:
             for t in titles[:-10]:
                 try:
@@ -210,44 +231,54 @@ def _is_finite_number(x) -> bool:
     except Exception:
         return False
 
-def _sanitize_for_sheets(df: pd.DataFrame) -> pd.DataFrame:
-    numeric_cols = ["Aktuell kurs","Utdelning/år","Utdelning/år (manuell)","Frekvens/år","Payment-lag (dagar)",
-                    "Antal aktier","GAV","Kurs (SEK)","Marknadsvärde (SEK)","Portföljandel (%)",
-                    "Insatt (SEK)","Årlig utdelning (SEK)","Direktavkastning (%)"]
+def _sanitize_for_sheets_as_text(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Skriv ALLT som TEXT till Sheets (för att undvika datum/%-korruption).
+    Appen kastar till float vid läsning.
+    """
     out = df.copy()
-    for c in numeric_cols:
-        if c in out.columns:
-            out[c] = out[c].apply(_to_float).apply(lambda v: float(v) if _is_finite_number(v) else 0.0)
+    out = out.fillna("")
+    # konvertera allt till str (med punkt som decimal)
+    def _fmt(v):
+        if pd.isna(v): return ""
+        try:
+            f = float(_to_float(v))
+            # behåll rimlig precision
+            return f"{f:.10g}"
+        except Exception:
+            return str(v)
     for c in out.columns:
-        if c not in numeric_cols:
-            out[c] = out[c].apply(lambda v: "" if (pd.isna(v) or str(v).lower()=="nan") else v)
-    out = out.replace([pd.NA, float("inf"), float("-inf")], "").fillna("")
+        out[c] = out[c].apply(_fmt)
     return out
 
 def spara_data_safe(df: pd.DataFrame, max_retries: int = 3):
     ws = skapa_koppling()
     out = säkerställ_kolumner(df).copy()
 
-    # Skydda mot tom sparning
     if out.empty or out["Ticker"].astype(str).str.strip().eq("").all():
         st.error("Sparning avbruten: tom data eller inga tickers.")
         return
 
-    # Läs nuvarande blad för jämförelse (anti-wipe)
+    # Anti-wipe: jämför antal tickers
     try:
         current_rows = ws.get_all_records()
     except Exception:
         current_rows = []
     current_df = säkerställ_kolumner(pd.DataFrame(current_rows))
+    old_n = int(current_df["Ticker"].astype(str).str.strip().ne("").sum()) if not current_df.empty else 0
+    new_n = int(out["Ticker"].astype(str).str.strip().ne("").sum())
 
-    def _count_tickers(d):
-        return int(d["Ticker"].astype(str).str.strip().ne("").sum())
-    old_n = _count_tickers(current_df)
-    new_n = _count_tickers(out)
-    if old_n > 0 and new_n < max(1, int(0.5 * old_n)):
-        st.error(f"Sparning stoppad: nya datasetet ({new_n} tickers) är mycket mindre än nuvarande ({old_n}).")
-        st.info("Kontrollera datan, eller spara igen efter att du fyllt på.")
+    if old_n > 0 and new_n < max(1, int(0.5*old_n)):
+        st.error(f"Sparning stoppad: nya datasetet ({new_n} tickers) << nuvarande ({old_n}).")
         return
+
+    # Försök rätta formatering innan skrivning
+    try:
+        ok, msg = ratta_sheet_format(SHEET_NAME)
+        if ok: st.caption("Sheet-format: TEXT (säkrat).")
+        else:  st.warning(msg)
+    except Exception as e:
+        st.warning(f"Format-försök misslyckades: {e}")
 
     # Backup före skrivning
     try:
@@ -255,10 +286,7 @@ def spara_data_safe(df: pd.DataFrame, max_retries: int = 3):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_title = f"_Backup_{timestamp}"
         backup_ws = sh.add_worksheet(title=backup_title, rows=1, cols=max(1, len(out.columns)))
-        try:
-            cur_rows = ws.get_all_values()
-        except Exception:
-            cur_rows = []
+        cur_rows = ws.get_all_values()
         if cur_rows:
             backup_ws.update(cur_rows, value_input_option="RAW")
         # trimma äldre backups
@@ -272,13 +300,11 @@ def spara_data_safe(df: pd.DataFrame, max_retries: int = 3):
     except Exception as e:
         st.warning(f"Kunde inte skapa backupflik (fortsätter ändå): {e}")
 
-    # Sanera data
-    out = _sanitize_for_sheets(out)
+    # Sanera: skriv allt som TEXT
+    out_txt = _sanitize_for_sheets_as_text(out)
+    header = [out_txt.columns.tolist()]
+    body   = out_txt.values.tolist()
 
-    header = [out.columns.tolist()]
-    body   = out.values.tolist()
-
-    # Uppdatera med retry/backoff
     for attempt in range(1, max_retries+1):
         try:
             ws.update(header + body, value_input_option="RAW")
@@ -291,9 +317,9 @@ def spara_data_safe(df: pd.DataFrame, max_retries: int = 3):
             st.error(f"Sparfel (avbryter): {e}")
             return
 
-    st.success("✅ Sparning klar (säkert läge).")
+    st.success("✅ Sparning klar (säker och textformat).")
 
-# 🔄 Alias – använd spara_data() i koden
+# Alias
 spara_data = spara_data_safe
 
 # ── Yahoo Finance-hämtning ────────────────────────────────────────────────
@@ -434,7 +460,7 @@ def calc_fees(order_value_sek: float, foreign: bool):
     total    = round(courtage + fx_fee, 2)
     return round(courtage,2), round(fx_fee,2), total
 
-# ── Sidebar: Växelkurser + snabb EN-uppdatering + manuell backup ─────────
+# ── Sidebar: FX + backup + Rätta Sheet + uppdatera EN ────────────────────
 def sidebar_tools():
     st.sidebar.header("⚙️ Inställningar")
     st.sidebar.markdown("**Växelkurser (SEK)**")
@@ -453,6 +479,10 @@ def sidebar_tools():
     if st.sidebar.button("📸 Ta backup nu"):
         autosnap_now()
 
+    if st.sidebar.button("🧹 Rätta Google Sheet (TEXT-format)"):
+        ok, msg = ratta_sheet_format(SHEET_NAME)
+        (st.sidebar.success if ok else st.sidebar.error)(msg)
+
     st.sidebar.markdown("---")
     one = st.sidebar.text_input("Uppdatera EN ticker (Yahoo)", placeholder="t.ex. VICI").strip().upper()
     if st.sidebar.button("🔄 Uppdatera EN"):
@@ -470,14 +500,11 @@ def sidebar_tools():
             st.session_state["working_df"] = base
             st.sidebar.success(f"{one} uppdaterad i minnet. Spara via menyn när du är klar.")
 
-# ── Settings-sida (mål & regler) + översikter + EXPORT till TrimCandidates ─
+# ── Settings-sida (mål & regler) + översikter + EXPORT TrimCandidates ────
 def page_settings(df: pd.DataFrame):
     st.subheader("⚖️ Regler & mål")
 
-    # Ladda regler
     gmax, cats = load_settings()
-
-    # Endast kategorier som finns nu, annars visa alla definierade
     present = sorted([c for c in df["Kategori"].dropna().astype(str).unique().tolist()])
     cats_view = {k: float(cats.get(k, 0.0)) for k in (present if present else cats.keys())}
 
@@ -503,29 +530,21 @@ def page_settings(df: pd.DataFrame):
 
     st.markdown("---")
 
-    # ===== ÖVERSIKTER =====
     d = uppdatera_nästa_utd(beräkna_allt(df).copy())
     if d.empty:
         st.info("Ingen data i portföljen ännu.")
         return
 
-    # --- Kategoriöversikt
     st.markdown("### 🧭 Kategoriöversikt")
-    if "Marknadsvärde (SEK)" not in d.columns:
-        d["Marknadsvärde (SEK)"] = 0.0
-    d["Kategori"] = d["Kategori"].astype(str).replace({"": "QUALITY"})
     T = float(d["Marknadsvärde (SEK)"].sum()) or 1.0
-
     cat_now = (d.groupby("Kategori", as_index=False)["Marknadsvärde (SEK)"].sum()
                  .rename(columns={"Marknadsvärde (SEK)":"MV"}))
     cat_now["Nu (%)"] = (100.0 * cat_now["MV"] / T).round(2)
     cat_now["Mål (%)"] = cat_now["Kategori"].apply(lambda c: float(cats.get(c, 0.0)))
     cat_now["Över/Under mål (pp)"] = (cat_now["Nu (%)"] - cat_now["Mål (%)"]).round(2)
     cat_now = cat_now.sort_values("Nu (%)", ascending=False)
-
     st.dataframe(cat_now[["Kategori","Nu (%)","Mål (%)","Över/Under mål (pp)"]], use_container_width=True)
 
-    # --- Bolagsöversikt
     st.markdown("### 🧩 Bolagsöversikt (andelar)")
     d["Vikt (%)"] = d["Portföljandel (%)"].round(2)
     comp_view = d[["Ticker","Bolagsnamn","Kategori","Vikt (%)","Marknadsvärde (SEK)"]]\
@@ -533,12 +552,11 @@ def page_settings(df: pd.DataFrame):
                    .reset_index(drop=True)
     st.dataframe(comp_view, use_container_width=True)
 
-    # --- Trim-kandidater
     st.markdown("### ✂️ Trim-kandidater")
     over_name = d[d["Vikt (%)"] > float(gmax)][["Ticker","Bolagsnamn","Kategori","Vikt (%)"]].copy()
     over_name["Skäl"] = [f"Över {gmax:.1f}% bolagstak"] * len(over_name)
-
     over_cats = cat_now[cat_now["Över/Under mål (pp)"] > 0.0]["Kategori"].tolist()
+
     rows = []
     if over_cats:
         subset = d[d["Kategori"].isin(over_cats)].copy()
@@ -552,14 +570,12 @@ def page_settings(df: pd.DataFrame):
                 "Skäl": "Kategori övervikt"
             })
     over_cat_df = pd.DataFrame(rows)
-
     trim_df = pd.concat([over_name, over_cat_df], ignore_index=True).drop_duplicates(subset=["Ticker","Skäl"])
 
     if trim_df.empty:
         st.success("Inga tydliga trim-kandidater just nu.")
     else:
         st.dataframe(trim_df.sort_values(["Skäl","Vikt (%)"], ascending=[True, False]), use_container_width=True)
-
         if st.button("📤 Exportera trim-kandidater till Google Sheets"):
             try:
                 sh = skapa_koppling_google_sheet()
@@ -573,14 +589,7 @@ def page_settings(df: pd.DataFrame):
             except Exception as e:
                 st.error(f"Kunde inte exportera: {e}")
 
-    with st.expander("ℹ️ Hur ska jag tolka tabellerna?"):
-        st.markdown(
-            "- **Kategoriöversikt**: Jämför nuvarande vikt mot dina mål. Positiv ”Över/Under mål” betyder övervikt.\n"
-            "- **Bolagsöversikt**: Sorterat på högst portföljandel – bra för att se tunga innehav.\n"
-            "- **Trim-kandidater**: Bolag som bryter mot bolagstaket **eller** ligger i överviktade kategorier."
-        )
-
-# ── Lägg till / uppdatera bolag (in-memory; spara via ”Spara”-sida) ──────
+# ── Lägg till / uppdatera bolag ───────────────────────────────────────────
 CATEGORY_CHOICES = ["QUALITY","REIT","mREIT","BDC","Shipping","Telecom","Tech","Bank","Finance","Energy","Industrial","Other"]
 
 def page_add_or_update(df: pd.DataFrame) -> pd.DataFrame:
@@ -666,7 +675,7 @@ def page_add_or_update(df: pd.DataFrame) -> pd.DataFrame:
         st.success("Sparat till Sheets.")
     return st.session_state.get("working_df", base)
 
-# ── Köpsimulator (≈500 kr-lotter) + visa TrimCandidates ───────────────────
+# ── Köpförslag & plan (≈500 kr lotter) ────────────────────────────────────
 def _n_affordable(price_sek, cash, foreign):
     if price_sek <= 0 or cash <= 0: return 0
     approx = int(max(1, cash // price_sek))
@@ -851,26 +860,6 @@ def page_calendar(df: pd.DataFrame):
     with st.expander("Detaljer per betalning"):
         st.dataframe(cal.sort_values("Datum"), use_container_width=True)
 
-# ── Transaktionslogg (kan användas senare vid behov) ──────────────────────
-def _ensure_tx_sheet():
-    sh = _open_sheet()
-    try:
-        return sh.worksheet(TX_SHEET)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=TX_SHEET, rows=1000, cols=8)
-        ws.update([["Datum","Ticker","Bolagsnamn","Antal","Kurs","Valuta","Total SEK","Kommentar"]],
-                  value_input_option="RAW")
-        return ws
-
-def logga_transaktioner(rows: list):
-    ws = _ensure_tx_sheet()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    out = []
-    for r in rows:
-        out.append([now] + r)
-    if out:
-        ws.append_rows(out, value_input_option="RAW")
-
 # ── Massuppdatering ───────────────────────────────────────────────────────
 def page_mass_update(df: pd.DataFrame) -> pd.DataFrame:
     st.subheader("⏩ Massuppdatera alla bolag (Yahoo)")
@@ -907,12 +896,135 @@ def page_save(df: pd.DataFrame):
         preview[["Ticker","Bolagsnamn","Valuta","Kategori","Antal aktier","GAV","Aktuell kurs","Utdelning/år","Kurs (SEK)","Årlig utdelning (SEK)"]],
         use_container_width=True
     )
-    danger = st.checkbox("⚠️ Tillåt riskabel överskrivning (använd bara om du vet vad du gör)", value=False)
+    danger = st.checkbox("⚠️ Tillåt riskabel överskrivning (anti-wipe kvarstår ändå)", value=False)
     if st.button("✅ Bekräfta och spara"):
-        if not danger:
-            spara_data(preview)   # har anti-wipe inuti
-        else:
-            spara_data(preview)
+        spara_data(preview)
+
+# ── Transaktionslogg (”Spara plan till Transaktioner”) ────────────────────
+def _ensure_tx_sheet():
+    sh = _open_sheet()
+    try:
+        return sh.worksheet(TX_SHEET)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=TX_SHEET, rows=1000, cols=10)
+        ws.update([["Tid","Typ","Ticker","Antal","Pris (SEK)","Valuta","Belopp (SEK)","Courtage","FX-avg","Kommentar"]],
+                  value_input_option="RAW")
+        return ws
+
+def save_sell_plan_to_log(rows: list):
+    ws = _ensure_tx_sheet()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    out = []
+    for r in rows:
+        out.append([now,"SÄLJ-PLAN", r["Ticker"], r["Antal"], r["Pris (SEK)"], r["Valuta"],
+                    r["Belopp (SEK)"], r["Courtage"], r["FX-avg"], r.get("Kommentar","")])
+    if out:
+        ws.append_rows(out, value_input_option="RAW")
+
+# ── Trim/Sälj-simulator ───────────────────────────────────────────────────
+def _sell_needed_name_cap(Vi, T, p, m_pct):
+    """n >= (Vi - m*T) / (p*(1-m))"""
+    if p <= 0: return 0
+    m = m_pct/100.0
+    numer = Vi - m*T
+    denom = p*(1.0 - m)
+    if numer <= 0 or denom <= 0: return 0
+    return int(math.ceil(numer/denom))
+
+def _sell_needed_cat_cap(C, T, p, M_pct):
+    """n >= (C - M*T) / (p*(1-M))"""
+    if p <= 0: return 0
+    M = M_pct/100.0
+    numer = C - M*T
+    denom = p*(1.0 - M)
+    if numer <= 0 or denom <= 0: return 0
+    return int(math.ceil(numer/denom))
+
+def page_trim_simulator(df: pd.DataFrame):
+    st.subheader("✂️ Sälj/Trim-simulator (utan att röra innehaven)")
+
+    d = uppdatera_nästa_utd(beräkna_allt(df).copy())
+    if d.empty:
+        st.info("Ingen data i portföljen ännu.")
+        return
+
+    gmax, cats = load_settings()
+    T = float(d["Marknadsvärde (SEK)"].sum()) or 1.0
+    cat_now = d.groupby("Kategori", as_index=False)["Marknadsvärde (SEK)"].sum().rename(columns={"Marknadsvärde (SEK)":"C"})
+    cat_map = dict(zip(cat_now["Kategori"], cat_now["C"]))
+
+    # Kandidater: sådana som bryter mot bolagstak eller ligger i överviktade kategorier
+    over_cat_list = []
+    for k, C in cat_map.items():
+        M = float(cats.get(k, 100.0))
+        if (100.0*C/T) > M + 1e-9:
+            over_cat_list.append(k)
+
+    rows = []
+    for _, r in d.iterrows():
+        tkr = r["Ticker"]; cat = r["Kategori"]; val = str(r["Valuta"]).upper()
+        p = float(_to_float(r["Kurs (SEK)"]))
+        qty = int(_to_float(r["Antal aktier"]))
+        Vi = float(_to_float(r["Marknadsvärde (SEK)"]))
+        C  = float(cat_map.get(cat, 0.0))
+        foreign = (val != "SEK")
+
+        n_name = _sell_needed_name_cap(Vi, T, p, gmax)
+        n_cat  = _sell_needed_cat_cap(C,  T, p, float(cats.get(cat, 100.0)))
+        n_req  = max(n_name, n_cat) if (cat in over_cat_list or n_name>0) else 0
+        if n_req <= 0: 
+            continue
+        n = min(n_req, qty)
+        if n <= 0:
+            continue
+
+        gross = round(p * n, 2)
+        c_fee, fx_fee, tot_fee = calc_fees(gross, foreign)
+        net = round(gross - tot_fee, 2)
+        rows.append({
+            "Ticker": tkr, "Kategori": cat, "Valuta": val, "Pris (SEK)": round(p,2),
+            "Antal": int(n), "Belopp (SEK)": gross, "Courtage": c_fee, "FX-avg": fx_fee,
+            "Nettolikvid (SEK)": net,
+            "Skäl": ("Bolag>tak" if n_name>0 else "") + (" & " if (n_name>0 and n_cat>0) else "") + ("Kat>mål" if n_cat>0 else "")
+        })
+
+    if not rows:
+        st.success("Inga sälj/trim behövs enligt reglerna just nu.")
+        return
+
+    sug = pd.DataFrame(rows).sort_values(["Skäl","Belopp (SEK)"], ascending=[True, False])
+    st.dataframe(sug, use_container_width=True)
+
+    # Plan i minnet
+    if "sell_plan" not in st.session_state:
+        st.session_state["sell_plan"] = []
+
+    colA, colB, colC = st.columns(3)
+    with colA:
+        if st.button("➕ Lägg ALLA i säljplan (minne)"):
+            for _, r in sug.iterrows():
+                st.session_state["sell_plan"].append({
+                    "Ticker": r["Ticker"], "Kategori": r["Kategori"], "Valuta": r["Valuta"],
+                    "Antal": int(r["Antal"]), "Pris (SEK)": float(r["Pris (SEK)"]),
+                    "Belopp (SEK)": float(r["Belopp (SEK)"]), "Courtage": float(r["Courtage"]),
+                    "FX-avg": float(r["FX-avg"]), "Kommentar": r["Skäl"]
+                })
+            st.success("Säljplan uppdaterad i minnet.")
+    with colB:
+        if st.button("🧹 Töm säljplan (minne)"):
+            st.session_state["sell_plan"] = []
+            st.success("Säljplan tömd.")
+    with colC:
+        if st.button("📝 Spara säljplan till Transaktioner"):
+            if not st.session_state["sell_plan"]:
+                st.warning("Planen är tom.")
+            else:
+                save_sell_plan_to_log(st.session_state["sell_plan"])
+                st.success("Säljplan sparad till fliken 'Transaktioner' (utan att ändra antal).")
+
+    if st.session_state["sell_plan"]:
+        st.markdown("### Säljplan i minnet")
+        st.dataframe(pd.DataFrame(st.session_state["sell_plan"]), use_container_width=True)
 
 # ── MAIN ──────────────────────────────────────────────────────────────────
 def main():
@@ -928,7 +1040,7 @@ def main():
     # Kör autosnap var 5 min (säkerhetskopia av huvudbladet)
     autosnap_if_due(300)
 
-    # Sidebar (FX + snabb “uppdatera EN” + backup)
+    # Sidebar (FX + snabb “uppdatera EN” + backup + rätta sheet)
     sidebar_tools()
 
     page = st.sidebar.radio(
@@ -939,6 +1051,7 @@ def main():
             "➕ Lägg till / ✏ Uppdatera bolag",
             "⏩ Massuppdatera alla",
             "🎯 Köpförslag & plan",
+            "✂️ Sälj/Trim-simulator",
             "📅 Utdelningskalender",
             "💾 Spara"
         ],
@@ -958,6 +1071,8 @@ def main():
         base = page_mass_update(base)
     elif page == "🎯 Köpförslag & plan":
         page_buy_planner(base)
+    elif page == "✂️ Sälj/Trim-simulator":
+        page_trim_simulator(base)
     elif page == "📅 Utdelningskalender":
         page_calendar(base)
     elif page == "💾 Spara":
