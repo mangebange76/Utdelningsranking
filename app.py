@@ -1,4 +1,3 @@
-# ── Del 1 ─────────────────────────────────────────────────────────────────
 import streamlit as st
 import pandas as pd
 import gspread
@@ -41,7 +40,7 @@ def skapa_koppling():
     try:
         return sh.worksheet(SHEET_NAME)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=SHEET_NAME, rows=2000, cols=50)
+        ws = sh.add_worksheet(title=SHEET_NAME, rows=1000, cols=50)
         ws.update([["Ticker"]], value_input_option="RAW")
         return ws
 
@@ -72,7 +71,6 @@ EXPECTED_HEADERS = [
     "Utdelningskälla","Senaste uppdatering","Källa"
 ]
 
-# hur många decimaler vi vill formatera som "tal" i Sheets (används när vi skriver)
 EXPECTED_NUMERIC = {
     "Aktuell kurs": 4, "Utdelning/år": 8, "Utdelning/år (manuell)": 8,
     "Frekvens/år": 0, "Payment-lag (dagar)": 0, "Antal aktier": 0, "GAV": 6,
@@ -99,20 +97,19 @@ def _collapse_multiple_dots(s: str) -> str:
     return s[:i+1] + s[i+1:].replace(".", "")
 
 def _repair_numeric_str(x) -> float:
-    """Robust tolkning av tal från Sheets; lagar kommatecken, '09:18', '12500'->'125.00' m.m."""
     if pd.isna(x): return 0.0
     s = str(x).strip()
     if not s: return 0.0
-    if ":" in s: s = s.replace(":", ".")                    # 09:18 → 9.18
-    s = s.replace(",", ".")                                  # europeiskt komma
-    s = re.sub(r"[^0-9\.\-]", "", s)                         # ta bort konstiga tecken
-    s = _collapse_multiple_dots(s)                           # 1.234.56 → 1.23456
+    if ":" in s: s = s.replace(":", ".")
+    s = s.replace(",", ".")
+    s = re.sub(r"[^0-9\.\-]", "", s)
+    s = _collapse_multiple_dots(s)
     if s in ("", ".", "-", "-."): return 0.0
     try:
         v = float(s)
     except Exception:
         return 0.0
-    # Heuristik: 13200 -> 132.00, 1251600 -> 125.16 (typiskt fel från mobil/Sheets)
+    # Heuristik: 13200 -> 132.00, 1251600 -> 125.16
     if abs(v) >= 1000 and abs(v) < 1e12:
         if re.fullmatch(r"-?\d+00", s): v = v/100.0
         elif re.fullmatch(r"-?\d+0000", s): v = v/10000.0
@@ -136,18 +133,16 @@ def säkerställ_kolumner(df: pd.DataFrame) -> pd.DataFrame:
         if c not in d.columns: d[c] = ""
     d["Ticker"]   = d["Ticker"].astype(str).str.strip().str.upper()
     d["Valuta"]   = d["Valuta"].astype(str).str.strip().str.upper()
-    d["Kategori"] = d["Kategori"].astype(str).str.strip().replace({"": "QUALITY", "nan": "QUALITY", "None": "QUALITY"})
+    d["Kategori"] = d["Kategori"].astype(str).replace({"": "QUALITY"})
     if "Lås utdelning" not in d.columns: d["Lås utdelning"] = False
     if "Utdelningskälla" not in d.columns: d["Utdelningskälla"] = "Yahoo"
     return d[EXPECTED_HEADERS].copy()
 
 def _apply_sheet_formats(ws, headers):
-    """Efter skrivning: tvinga numeriska kolumner att vara tal och andra som text i Google Sheets."""
     sheet_id = ws._properties.get("sheetId")
     if not sheet_id: return
     idx = {h: i for i, h in enumerate(headers)}
     reqs = []
-    # numeriska -> NUMBER med rätt decimaler
     for name, dec in EXPECTED_NUMERIC.items():
         if name not in idx: continue
         col = idx[name]
@@ -159,7 +154,6 @@ def _apply_sheet_formats(ws, headers):
                 "fields": "userEnteredFormat.numberFormat"
             }
         })
-    # övriga -> TEXT
     for name in ("Ticker","Bolagsnamn","Valuta","Kategori","Utdelningsfrekvens","Ex-Date",
                  "Nästa utbetalning (est)","Utdelningskälla","Källa","Senaste uppdatering"):
         if name not in idx: continue
@@ -184,11 +178,10 @@ def hamta_data():
         headers_in = raw[0]
         headers_fix = _dedupe_headers(headers_in)
         df = pd.DataFrame(raw[1:], columns=headers_fix)
-        # Mappa ev. dublettrubriker "X (2)" tillbaka till "X"
+        # Mappa tillbaka dup-rubriker till basnamn
         rename_map = {}
         for h in headers_fix:
-            if h in EXPECTED_HEADERS: 
-                rename_map[h] = h
+            if h in EXPECTED_HEADERS: rename_map[h] = h
             else:
                 base = h.split(" (")[0]
                 if base in EXPECTED_HEADERS: rename_map[h] = base
@@ -200,39 +193,22 @@ def hamta_data():
         st.warning(f"Kunde inte läsa Google Sheet: {e}")
         return säkerställ_kolumner(pd.DataFrame())
 
-# ── Settings (GLOBAL_MAX + kategori-mål) ──────────────────────────────────
+# ── Settings (GLOBAL_MAX + kategori-mål + strategi) ───────────────────────
 DEFAULT_GLOBAL_MAX = 12.0
-
-# Bas-kategorier + dina framtidssäkra kategorier
-BASE_CATS = [
-    "QUALITY","REIT","mREIT","BDC","Shipping","Telecom","Tech","Bank","Finance","Energy","Industrial","Other"
-]
-FUTURE_CATS = [
-    "AI / Kvant / Biotech AI",
-    "Autonoma system & mobilitet",
-    "Moln / SaaS / Ad-tech",
-    "Konsument & betting",
-    "Semiconductors & AI-hårdvara",
-    "Industriell AI & automation",
-    "Green energy & Grid",
-    "Healthcare",
-    "Cybersecurity",
-    "Payments/Fintech",
-    "Data infra & Analytics",
-    "Space & Defense",
-    "Materials & Mining",
-    "Real Assets/Infra",
-]
-
-# Standardmål – sätt riktiga defaultar för dina gamla kategorier,
-# och 0.0 för de nya (du kan ändra i appen när de börjar användas)
 DEFAULT_CAT_TARGETS = {
     "QUALITY": 40.0, "REIT": 25.0, "mREIT": 10.0, "BDC": 15.0,
     "Shipping": 25.0, "Telecom": 20.0, "Tech": 25.0, "Bank": 20.0,
     "Finance": 20.0, "Energy": 25.0, "Industrial": 20.0, "Other": 10.0,
+    # Nya framtidssäkrade teman
+    "AI / Kvant / Biotech AI": 20.0,
+    "Autonoma system & mobilitet": 15.0,
+    "Moln / SaaS / Ad-tech": 20.0,
+    "Konsument & betting": 10.0,
+    "Semiconductors & AI-hårdvara": 20.0,
+    "Industriell AI & automation": 15.0,
 }
-for _c in FUTURE_CATS:
-    DEFAULT_CAT_TARGETS.setdefault(_c, 0.0)
+
+DEFAULT_STRATEGY = "Utdelningsfokus"  # "Balans" eller "Neutral"
 
 def _ensure_settings_sheet():
     sh = _open_sheet()
@@ -241,7 +217,8 @@ def _ensure_settings_sheet():
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=SET_SHEET, rows=400, cols=4)
         rows = [["Key","Value","Type","Note"],
-                ["GLOBAL_MAX_NAME", str(DEFAULT_GLOBAL_MAX), "float","max vikt per bolag i %"]]
+                ["GLOBAL_MAX_NAME", str(DEFAULT_GLOBAL_MAX), "float","max vikt per bolag i %"],
+                ["STRATEGY", DEFAULT_STRATEGY, "text","Utdelningsfokus/Balans/Neutral"]]
         for k,v in DEFAULT_CAT_TARGETS.items():
             rows.append([f"CAT_{k}", str(v), "float","kategori-mål %"])
         ws.update(rows, value_input_option="RAW")
@@ -252,28 +229,29 @@ def load_settings():
     recs = ws.get_all_records()
     gmax = DEFAULT_GLOBAL_MAX
     cats = DEFAULT_CAT_TARGETS.copy()
+    strategy = DEFAULT_STRATEGY
     for r in recs:
         key = str(r.get("Key",""))
+        if key == "STRATEGY":
+            strategy = str(r.get("Value") or DEFAULT_STRATEGY).strip() or DEFAULT_STRATEGY
+            continue
         val = _repair_numeric_str(r.get("Value",""))
         if key == "GLOBAL_MAX_NAME" and val>0:
             gmax = float(val)
         elif key.startswith("CAT_"):
             cats[key[4:]] = float(val)
-    return gmax, cats
+    return gmax, cats, strategy
 
-def save_settings(global_max, cat_targets: dict):
+def save_settings(global_max, cat_targets: dict, strategy: str):
     ws = _ensure_settings_sheet()
     rows = [["Key","Value","Type","Note"],
-            ["GLOBAL_MAX_NAME", str(float(global_max)), "float","max vikt per bolag i %"]]
-    # inkludera ALLA kända kategorier (både bas och framtid)
-    all_keys = set(DEFAULT_CAT_TARGETS.keys()) | set(cat_targets.keys())
-    for k in sorted(all_keys):
-        v = float(cat_targets.get(k, DEFAULT_CAT_TARGETS.get(k, 0.0)))
-        rows.append([f"CAT_{k}", str(v), "float","kategori-mål %"])
+            ["GLOBAL_MAX_NAME", str(float(global_max)), "float","max vikt per bolag i %"],
+            ["STRATEGY", strategy, "text","Utdelningsfokus/Balans/Neutral"]]
+    for k,v in cat_targets.items():
+        rows.append([f"CAT_{k}", str(float(v)), "float","kategori-mål %"])
     ws.clear()
     ws.update(rows, value_input_option="RAW")
 
-# ── Del 2 ─────────────────────────────────────────────────────────────────
 # ── Autosnap (backup var 5:e minut, behåll 10 st) ─────────────────────────
 def _list_backup_titles(sh):
     try:
@@ -291,7 +269,7 @@ def autosnap_now():
         if cur:
             backup_ws.update(cur, value_input_option="RAW")
         # trimma äldre backups (behåll 10 senaste)
-        titles = sorted(_list_backup_titles(sh))  # lexikografiskt funkar med tidsstämpel
+        titles = sorted(_list_backup_titles(sh))
         if len(titles) > 10:
             for t in titles[:-10]:
                 try:
@@ -396,7 +374,6 @@ def spara_data(df: pd.DataFrame, max_retries: int = 3):
         try:
             ws.clear()
             ws.update(header + body, value_input_option="RAW")
-            # Sätt cellformat (tal/text) för att undvika framtida “tid/datums-fel”
             _apply_sheet_formats(ws, EXPECTED_HEADERS)
             st.success("✅ Sparning klar.")
             return
@@ -455,7 +432,18 @@ def fetch_yahoo(ticker: str) -> dict:
                 cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=365)
                 last12 = divs[divs.index >= cutoff]
                 div_year = float(last12.tail(12).sum()) if not last12.empty else 0.0
-                freq = int(last12.shape[0]) if not last12.empty else 0
+                # frekvens – tolka robust
+                cnt = int(last12.shape[0]) if not last12.empty else 0
+                if cnt >= 10:       # månads (eller tätare)
+                    freq = 12
+                elif cnt >= 3:      # kvartals
+                    freq = 4
+                elif cnt == 2:      # halvår
+                    freq = 2
+                elif cnt == 1:      # års
+                    freq = 1
+                else:
+                    freq = 0
                 ex_date = pd.to_datetime(divs.index.max()).strftime("%Y-%m-%d")
         except Exception:
             pass
@@ -504,7 +492,6 @@ def beräkna_allt(df: pd.DataFrame) -> pd.DataFrame:
     d = säkerställ_kolumner(df).copy()
     d["Kategori"] = d["Kategori"].astype(str).replace({"": "QUALITY"})
 
-    # Manuell låsning av utdelning
     lock = d["Lås utdelning"].apply(lambda x: bool(x) if str(x).upper() not in ("FALSE","0","") else False)
     div_manual = pd.to_numeric(d["Utdelning/år (manuell)"].apply(_repair_numeric_str), errors="coerce").fillna(0.0).astype(float)
     div_yahoo  = pd.to_numeric(d["Utdelning/år"].apply(_repair_numeric_str),        errors="coerce").fillna(0.0).astype(float)
@@ -512,12 +499,10 @@ def beräkna_allt(df: pd.DataFrame) -> pd.DataFrame:
     d.loc[(lock) & (div_manual > 0), "Utdelning/år_eff"] = div_manual
     d["Utdelningskälla"] = ["Manuell 🔒" if (l and m>0) else "Yahoo" for l, m in zip(lock, div_manual)]
 
-    # Kurser & FX
     prices = pd.to_numeric(d["Aktuell kurs"].apply(_repair_numeric_str), errors="coerce").fillna(0.0).astype(float)
     rates  = pd.to_numeric(d["Valuta"].apply(fx_for),                    errors="coerce").fillna(1.0).astype(float)
     d["Kurs (SEK)"] = (prices * rates).astype(float).round(6)
 
-    # Volymer & insatt kapital
     qty = pd.to_numeric(d["Antal aktier"].apply(_repair_numeric_str), errors="coerce").fillna(0.0).astype(float)
     gav = pd.to_numeric(d["GAV"].apply(_repair_numeric_str),          errors="coerce").fillna(0.0).astype(float)
     div_eff = pd.to_numeric(d["Utdelning/år_eff"], errors="coerce").fillna(0.0).astype(float)
@@ -534,29 +519,19 @@ def beräkna_allt(df: pd.DataFrame) -> pd.DataFrame:
 
     return d
 
-# ── Del 3 ─────────────────────────────────────────────────────────────────
 # ── Sidebar: Växelkurser + snabb EN-uppdatering + manuell backup ─────────
 def sidebar_tools():
     st.sidebar.header("⚙️ Inställningar")
     st.sidebar.markdown("**Växelkurser (SEK)**")
     c1, c2 = st.sidebar.columns(2)
     with c1:
-        st.session_state["USDSEK"] = st.number_input(
-            "USD/SEK", 0.0, value=float(st.session_state["USDSEK"]), step=0.01, format="%.4f"
-        )
-        st.session_state["EURSEK"] = st.number_input(
-            "EUR/SEK", 0.0, value=float(st.session_state["EURSEK"]), step=0.01, format="%.4f"
-        )
+        st.session_state["USDSEK"] = st.number_input("USD/SEK", 0.0, value=float(st.session_state["USDSEK"]), step=0.01, format="%.4f")
+        st.session_state["EURSEK"] = st.number_input("EUR/SEK", 0.0, value=float(st.session_state["EURSEK"]), step=0.01, format="%.4f")
     with c2:
-        st.session_state["CADSEK"] = st.number_input(
-            "CAD/SEK", 0.0, value=float(st.session_state["CADSEK"]), step=0.01, format="%.4f"
-        )
-        st.session_state["NOKSEK"] = st.number_input(
-            "NOK/SEK", 0.0, value=float(st.session_state["NOKSEK"]), step=0.01, format="%.4f"
-        )
+        st.session_state["CADSEK"] = st.number_input("CAD/SEK", 0.0, value=float(st.session_state["CADSEK"]), step=0.01, format="%.4f")
+        st.session_state["NOKSEK"] = st.number_input("NOK/SEK", 0.0, value=float(st.session_state["NOKSEK"]), step=0.01, format="%.4f")
     if st.sidebar.button("↩︎ Återställ FX"):
-        for k, v in DEF_FX.items():
-            st.session_state[k] = v
+        for k,v in DEF_FX.items(): st.session_state[k] = v
         st.sidebar.success("Standardkurser återställda.")
 
     st.sidebar.markdown("---")
@@ -569,96 +544,163 @@ def sidebar_tools():
         base = säkerställ_kolumner(st.session_state.get("working_df", pd.DataFrame()))
         if one:
             if one not in base["Ticker"].tolist():
-                base = pd.concat(
-                    [base, pd.DataFrame([{"Ticker": one, "Kategori": "QUALITY"}])],
-                    ignore_index=True,
-                )
+                base = pd.concat([base, pd.DataFrame([{"Ticker":one, "Kategori":"QUALITY"}])], ignore_index=True)
             vals = fetch_yahoo(one)
-            m = base["Ticker"] == one
-            for k in ["Aktuell kurs", "Valuta", "Bolagsnamn", "Utdelning/år", "Frekvens/år", "Ex-Date", "Källa"]:
-                if k in vals and vals[k] not in (None, ""):
+            m = base["Ticker"]==one
+            for k in ["Aktuell kurs","Valuta","Bolagsnamn","Utdelning/år","Frekvens/år","Ex-Date","Källa"]:
+                if k in vals and vals[k] not in (None,""):
                     base.loc[m, k] = vals[k]
             base = beräkna_allt(base)
             base = uppdatera_nästa_utd(base)
             st.session_state["working_df"] = base
             st.sidebar.success(f"{one} uppdaterad i minnet. Spara via menyn när du är klar.")
 
-# ── Settings-sida (max per bolag & kategori-mål) + sammanställning ───────
+# ── Settings-sida (max per bolag & kategori-mål + STRATEGI + sammanställning) ──
+CATEGORY_CHOICES = [
+    "QUALITY","REIT","mREIT","BDC","Shipping","Telecom","Tech","Bank",
+    "Finance","Energy","Industrial","Other",
+    "AI / Kvant / Biotech AI","Autonoma system & mobilitet","Moln / SaaS / Ad-tech",
+    "Konsument & betting","Semiconductors & AI-hårdvara","Industriell AI & automation"
+]
+
 def page_settings(df: pd.DataFrame):
     st.subheader("⚖️ Regler & mål")
-    gmax, cats = load_settings()
+    gmax, cats, strategy = load_settings()
 
-    # Visa bara kategorier som finns i databasen (för mål-editorn)
+    # visa bara kategorier som finns i databasen (om tomt: visa alla)
     present = sorted([c for c in df["Kategori"].dropna().astype(str).unique().tolist()])
-    cats_view = {k: float(cats.get(k, 0.0)) for k in present} if present else cats
+    cats_view = {k: float(cats.get(k, 0.0)) for k in (present if present else cats.keys())}
 
-    # Editera max per bolag + mål per kategori
-    col = st.columns(2)
+    col = st.columns(3)
     with col[0]:
-        gmax_new = st.number_input(
-            "Max vikt per bolag (%)", min_value=1.0, max_value=100.0, value=float(gmax), step=0.5
-        )
+        gmax_new = st.number_input("Max vikt per bolag (%)", min_value=1.0, max_value=100.0, value=float(gmax), step=0.5)
     with col[1]:
+        strat_new = st.selectbox("Strategi (rankning för köpförslag)", options=["Utdelningsfokus","Balans","Neutral"], index=["Utdelningsfokus","Balans","Neutral"].index(strategy if strategy in ["Utdelningsfokus","Balans","Neutral"] else "Utdelningsfokus"))
+        st.caption("Utdelningsfokus (50/35/15), Balans (30/60/10), Neutral (0/100/0).")
+    with col[2]:
         st.caption("Kategorimål (%) – används för att dämpa överviktade kategorier i köpförslag.")
 
-    edit_df = pd.DataFrame([{"Kategori": k, "Mål (%)": v} for k, v in cats_view.items()]).sort_values("Kategori")
+    edit_df = pd.DataFrame([{"Kategori":k, "Mål (%)":v} for k,v in cats_view.items()]).sort_values("Kategori")
     edited = st.data_editor(
-        edit_df,
-        hide_index=True,
-        use_container_width=True,
+        edit_df, hide_index=True, use_container_width=True,
         column_config={
             "Kategori": st.column_config.TextColumn(disabled=True),
-            "Mål (%)": st.column_config.NumberColumn(min_value=0.0, max_value=100.0, step=0.5, format="%.2f"),
-        },
+            "Mål (%)": st.column_config.NumberColumn(min_value=0.0, max_value=100.0, step=0.5, format="%.2f")
+        }
     )
+
     if st.button("💾 Spara regler"):
         new_cats = {row["Kategori"]: float(row["Mål (%)"]) for _, row in edited.iterrows()}
-        save_settings(gmax_new, new_cats)
-        st.success("Regler sparade till Settings.")
+        save_settings(gmax_new, new_cats, strat_new)
+        st.success("Regler & strategi sparade till Settings.")
 
     st.markdown("---")
-    st.subheader("📊 Sammanställning av nuvarande portfölj")
+    st.markdown("### 📊 Sammanställning (nuvarande vikt)")
 
-    # Robust beräkning
-    calc = beräkna_allt(säkerställ_kolumner(df)).copy()
-    # Endast rader med värde
-    calc["Marknadsvärde (SEK)"] = pd.to_numeric(calc["Marknadsvärde (SEK)"], errors="coerce").fillna(0.0)
-    calc["Portföljandel (%)"]   = pd.to_numeric(calc["Portföljandel (%)"],   errors="coerce").fillna(0.0)
-    calc["Kategori"]            = calc["Kategori"].astype(str)
+    d = beräkna_allt(df).copy()
+    # Kategoriandelar
+    cat_table = d.groupby("Kategori", as_index=False)["Marknadsvärde (SEK)"].sum()
+    tot_mv = float(cat_table["Marknadsvärde (SEK)"].sum()) or 1.0
+    cat_table["Andel (%)"] = (100.0 * cat_table["Marknadsvärde (SEK)"] / tot_mv).round(2)
+    st.markdown("#### 📂 Andel per kategori")
+    st.dataframe(cat_table.sort_values("Andel (%)", ascending=False), use_container_width=True)
 
-    total_mv = float(calc["Marknadsvärde (SEK)"].sum()) or 1.0
+    # Expanders per kategori: lista bolag & andel
+    st.markdown("#### 🧭 Bolag per kategori & andel")
+    for cat in sorted(d["Kategori"].dropna().astype(str).unique().tolist()):
+        sub = d[d["Kategori"] == cat].copy()
+        if sub.empty: continue
+        sub["Andel av portfölj (%)"] = (100.0 * sub["Marknadsvärde (SEK)"] / tot_mv).round(2)
+        with st.expander(f"{cat}  —  {round(float(cat_table[cat_table['Kategori']==cat]['Andel (%)'].values[0]),2)} % av portföljen"):
+            st.dataframe(sub[["Ticker","Bolagsnamn","Antal aktier","Kurs (SEK)","Marknadsvärde (SEK)","Andel av portfölj (%)"]]
+                         .sort_values("Andel av portfölj (%)", ascending=False),
+                         use_container_width=True)
 
-    # 1) Andel per kategori (med mål)
-    cat_summary = (
-        calc.groupby("Kategori", as_index=False)["Marknadsvärde (SEK)"]
-        .sum()
-        .rename(columns={"Marknadsvärde (SEK)": "MV (SEK)"})
-    )
-    cat_summary["Andel (%)"] = (100.0 * cat_summary["MV (SEK)"] / total_mv).round(2)
-    cat_summary["Mål (%)"]   = cat_summary["Kategori"].map(lambda k: float(cats.get(k, 0.0))).fillna(0.0)
-    cat_summary = cat_summary.sort_values("Andel (%)", ascending=False)
+# ── Lägg till / uppdatera bolag (in-memory; spara via ”Spara”-sidan) ─────
+def page_add_or_update(df: pd.DataFrame) -> pd.DataFrame:
+    st.subheader("➕ Lägg till / ✏ Uppdatera bolag")
+    base = säkerställ_kolumner(df).copy()
 
-    st.markdown("**Andel per kategori (nuvarande vs. mål):**")
-    st.dataframe(cat_summary, use_container_width=True)
+    tickers = ["Ny"] + sorted(base["Ticker"].unique().tolist())
+    val = st.selectbox("Välj bolag", tickers)
 
-    # 2) Rullista – bolag inom vald kategori
-    st.markdown("**Bolag per kategori (andel av portfölj):**")
-    categories = ["Alla"] + cat_summary["Kategori"].tolist()
-    chosen = st.selectbox("Välj kategori", options=categories, index=0)
-
-    comp = calc.copy()
-    comp["MV (SEK)"] = comp["Marknadsvärde (SEK)"]
-    comp["Andel (%)"] = (100.0 * comp["Portföljandel (%)"]).round(2)  # redan andel – men säkerställ format
-    cols = ["Kategori", "Ticker", "Bolagsnamn", "MV (SEK)", "Andel (%)"]
-
-    if chosen != "Alla":
-        view = comp[comp["Kategori"] == chosen][cols].sort_values(["Andel (%)", "MV (SEK)"], ascending=False)
-        st.dataframe(view, use_container_width=True)
+    if val == "Ny":
+        tkr = st.text_input("Ticker").strip().upper()
+        antal = st.number_input("Antal aktier", min_value=0, value=0, step=1)
+        gav   = st.number_input("GAV (i **lokal** valuta)", min_value=0.0, value=0.0, step=0.01)
+        kategori = st.selectbox("Kategori", options=CATEGORY_CHOICES, index=0)
+        c1,c2 = st.columns(2)
+        with c1:
+            if st.button("🌐 Hämta från Yahoo"):
+                if not tkr:
+                    st.warning("Ange ticker först.")
+                else:
+                    vals = fetch_yahoo(tkr)
+                    if vals:
+                        st.info(f"{vals.get('Bolagsnamn',tkr)} | {vals.get('Valuta','?')} | Kurs {vals.get('Aktuell kurs',0)} | Utd/år {vals.get('Utdelning/år',0)} | Freq {vals.get('Frekvens/år',0)} | ExDate {vals.get('Ex-Date','')}")
+        with c2:
+            if st.button("➕ Lägg till i minnet"):
+                if not tkr:
+                    st.error("Ticker måste anges.")
+                else:
+                    row = {"Ticker":tkr,"Bolagsnamn":tkr,"Kategori":kategori,"Antal aktier":antal,"GAV":gav,
+                           "Valuta":"SEK","Aktuell kurs":0.0,"Utdelning/år":0.0,"Frekvens/år":0,"Ex-Date":""}
+                    vals = fetch_yahoo(tkr)
+                    for k in ["Aktuell kurs","Valuta","Bolagsnamn","Utdelning/år","Frekvens/år","Ex-Date","Källa"]:
+                        if vals.get(k) not in (None,""):
+                            row[k] = vals[k]
+                    base = pd.concat([base, pd.DataFrame([row])], ignore_index=True)
+                    base = beräkna_allt(base)
+                    base = uppdatera_nästa_utd(base)
+                    st.session_state["working_df"] = base
+                    st.success(f"{tkr} tillagt i minnet. Gå till 💾 Spara för att skriva till Sheets.")
     else:
-        view = comp[cols].sort_values(["Kategori", "Andel (%)"], ascending=[True, False])
-        st.dataframe(view, use_container_width=True)
+        r = base[base["Ticker"]==val].iloc[0]
+        tkr = st.text_input("Ticker", value=r["Ticker"]).strip().upper()
+        antal = st.number_input("Antal aktier", min_value=0, value=int(_repair_numeric_str(r["Antal aktier"])), step=1)
+        gav   = st.number_input("GAV (i **lokal** valuta)", min_value=0.0, value=float(_repair_numeric_str(r["GAV"])), step=0.01)
+        cat_idx = CATEGORY_CHOICES.index(str(r.get("Kategori","QUALITY"))) if str(r.get("Kategori","QUALITY")) in CATEGORY_CHOICES else 0
+        kategori = st.selectbox("Kategori", options=CATEGORY_CHOICES, index=cat_idx)
+        c1,c2,c3 = st.columns(3)
+        with c1:
+            if st.button("🌐 Uppdatera från Yahoo"):
+                vals = fetch_yahoo(tkr)
+                m = base["Ticker"]==val
+                for k in ["Aktuell kurs","Valuta","Bolagsnamn","Utdelning/år","Frekvens/år","Ex-Date","Källa"]:
+                    if k in vals and vals[k] not in (None,""):
+                        base.loc[m,k] = vals[k]
+                base.loc[m,"Ticker"] = tkr
+                base.loc[m,"Antal aktier"] = antal
+                base.loc[m,"GAV"] = gav
+                base.loc[m,"Kategori"] = kategori
+                base = beräkna_allt(base)
+                base = uppdatera_nästa_utd(base)
+                st.session_state["working_df"] = base
+                st.success(f"{tkr} uppdaterad i minnet.")
+        with c2:
+            if st.button("✏ Uppdatera fält (minne)"):
+                m = base["Ticker"]==val
+                base.loc[m,"Ticker"] = tkr
+                base.loc[m,"Antal aktier"] = antal
+                base.loc[m,"GAV"] = gav
+                base.loc[m,"Kategori"] = kategori
+                base = beräkna_allt(base)
+                base = uppdatera_nästa_utd(base)
+                st.session_state["working_df"] = base
+                st.success(f"{tkr} uppdaterad i minnet.")
+        with c3:
+            if st.button("🗑 Ta bort (minne)"):
+                base = base[base["Ticker"]!=val].reset_index(drop=True)
+                base = beräkna_allt(base)
+                st.session_state["working_df"] = base
+                st.success(f"{val} borttagen i minnet.")
 
-# ── Del 4 ─────────────────────────────────────────────────────────────────
+    st.markdown("---")
+    if st.button("💾 Spara alla ändringar till Google Sheets"):
+        spara_data(beräkna_allt(st.session_state["working_df"]))
+        st.success("Sparat till Sheets.")
+    return st.session_state.get("working_df", base)
+
 # ── Avgifter (Avanza/Nordnet mini + FX) ───────────────────────────────────
 MIN_COURTAGE_RATE = 0.0025
 MIN_COURTAGE_SEK  = 1.0
@@ -686,18 +728,25 @@ def _n_affordable(price_sek, cash, foreign):
 
 def _cap_shares_limit(current_value, total_value, px, limit_pct):
     if px <= 0: return 0
-    m = max(0.0, float(limit_pct))/100.0
+    m = limit_pct/100.0
     numer = m*total_value - current_value
     denom = (1.0 - m) * px
     if denom <= 0: return 0
     return int(max(0, math.floor(numer/denom)))
 
+def _strategy_weights(name: str):
+    # Utdelningsfokus (50/35/15), Balans (30/60/10), Neutral (0/100/0)
+    if name == "Balans":
+        return 0.30, 0.60, 0.10
+    if name == "Neutral":
+        return 0.00, 1.00, 0.00
+    return 0.50, 0.35, 0.15  # default "Utdelningsfokus"
+
 def page_buy_planner(df: pd.DataFrame):
     st.subheader("🎯 Köpförslag & plan (≈500 kr per köp)")
-
     base = uppdatera_nästa_utd(beräkna_allt(df).copy())
 
-    gmax, cat_targets = load_settings()
+    gmax, cat_targets, strategy = load_settings()
     present_cats = set(base["Kategori"].astype(str).unique().tolist())
     cat_limits = {k: v for k, v in cat_targets.items() if k in present_cats}
 
@@ -709,7 +758,9 @@ def page_buy_planner(df: pd.DataFrame):
     with c3:
         gmax_ui = st.number_input("Max per bolag (%)", min_value=1.0, max_value=100.0, value=float(gmax), step=0.5)
 
-    # Scoring: DA + undervikt + nära utdelning
+    w_val, w_under, w_time = _strategy_weights(strategy)
+    st.caption(f"Aktiv strategi: **{strategy}** – vikter (DA/Undervikt/Timing) = {w_val:.2f}/{w_under:.2f}/{w_time:.2f}")
+
     def _score(r):
         da = float(_repair_numeric_str(r["Direktavkastning (%)"]))
         da_score = (min(max(da,0),15)/15.0)*100.0
@@ -718,38 +769,13 @@ def page_buy_planner(df: pd.DataFrame):
         dt = pd.to_datetime(r.get("Nästa utbetalning (est)",""), errors="coerce")
         days = 9999 if pd.isna(dt) else max(0,(dt.date()-date.today()).days)
         time_score = ((90 - min(days,90))/90.0)*100.0
-        return 0.5*da_score + 0.35*under_score + 0.15*time_score
+        return w_val*da_score + w_under*under_score + w_time*time_score
 
     cand = base.copy()
     cand["Poäng"] = cand.apply(_score, axis=1)
     cand = cand.sort_values("Poäng", ascending=False).reset_index(drop=True)
 
-    # Trims (kandidater att sälja/trimma)
-    T0 = float(pd.to_numeric(base["Marknadsvärde (SEK)"], errors="coerce").fillna(0.0).sum()) or 1.0
-    over_name = base[
-        pd.to_numeric(base["Portföljandel (%)"], errors="coerce").fillna(0.0) > float(gmax_ui)
-    ][["Ticker","Kategori","Portföljandel (%)","Marknadsvärde (SEK)"]].copy()
-    over_name = over_name.sort_values("Portföljandel (%)", ascending=False)
-
-    cat_mv = (base.groupby("Kategori", as_index=False)["Marknadsvärde (SEK)"].sum()
-                    .rename(columns={"Marknadsvärde (SEK)":"MV"}))
-    cat_mv["Andel (%)"] = (100.0*cat_mv["MV"]/T0).round(2)
-    cat_mv["Mål (%)"]   = cat_mv["Kategori"].map(lambda k: float(cat_limits.get(k, 100.0))).fillna(100.0)
-    over_cat = cat_mv[cat_mv["Andel (%)"] > cat_mv["Mål (%)"]].sort_values("Andel (%)", ascending=False)
-
-    with st.expander("✂️ Kandidater att sälja/trimma"):
-        if over_name.empty and over_cat.empty:
-            st.info("Inga uppenbara trim-kandidater givet nuvarande gränser.")
-        else:
-            if not over_name.empty:
-                st.markdown("**Över max per bolag:**")
-                st.dataframe(over_name, use_container_width=True)
-            if not over_cat.empty:
-                st.markdown("**Kategorier över mål:**")
-                st.dataframe(over_cat, use_container_width=True)
-
-    # Simulera köp i ~lot-omgångar tills cash förbrukad eller inga fler lagliga köp
-    T = float(pd.to_numeric(base["Marknadsvärde (SEK)"], errors="coerce").fillna(0.0).sum())
+    T = float(base["Marknadsvärde (SEK)"].sum())
     if T <= 0: T = 1.0
     cat_val = base.groupby("Kategori", as_index=False)["Marknadsvärde (SEK)"].sum().set_index("Kategori")["Marknadsvärde (SEK)"].to_dict()
     qty_map = base.set_index("Ticker")["Antal aktier"].to_dict()
@@ -806,21 +832,14 @@ def page_buy_planner(df: pd.DataFrame):
 # ── Portfölj ──────────────────────────────────────────────────────────────
 def page_portfolio(df: pd.DataFrame):
     st.subheader("📦 Portföljöversikt")
-    base = säkerställ_kolumner(df).copy()
-    d = uppdatera_nästa_utd(beräkna_allt(base).copy())
-
+    d = uppdatera_nästa_utd(beräkna_allt(df).copy())
     if d.empty:
         st.info("Lägg till minst ett bolag.")
         return
-
-    # Robust summering
-    d["Marknadsvärde (SEK)"]   = pd.to_numeric(d["Marknadsvärde (SEK)"], errors="coerce").fillna(0.0)
-    d["Insatt (SEK)"]          = pd.to_numeric(d["Insatt (SEK)"], errors="coerce").fillna(0.0)
-    d["Årlig utdelning (SEK)"] = pd.to_numeric(d["Årlig utdelning (SEK)"], errors="coerce").fillna(0.0)
-
-    tot_mv  = float(d["Marknadsvärde (SEK)"].sum())
-    tot_ins = float(d["Insatt (SEK)"].sum())
-    tot_div = float(d["Årlig utdelning (SEK)"].sum())
+    # Summor (robust)
+    tot_mv  = float(pd.to_numeric(d["Marknadsvärde (SEK)"], errors="coerce").fillna(0).sum())
+    tot_ins = float(pd.to_numeric(d["Insatt (SEK)"],         errors="coerce").fillna(0).sum())
+    tot_div = float(pd.to_numeric(d["Årlig utdelning (SEK)"],errors="coerce").fillna(0).sum())
 
     c1,c2,c3 = st.columns(3)
     c1.metric("Portföljvärde (SEK)", f"{tot_mv:,.0f}".replace(","," "))
@@ -832,9 +851,7 @@ def page_portfolio(df: pd.DataFrame):
         "Aktuell kurs","Kurs (SEK)","Marknadsvärde (SEK)","Portföljandel (%)",
         "Utdelning/år","Årlig utdelning (SEK)","Frekvens/år","Ex-Date","Nästa utbetalning (est)"
     ]
-
     view = d[show_cols].copy()
-    # Säkerställ numerik i rutnätet
     for col in ["Antal aktier","GAV","Aktuell kurs","Kurs (SEK)","Marknadsvärde (SEK)","Portföljandel (%)","Utdelning/år","Årlig utdelning (SEK)"]:
         view[col] = pd.to_numeric(view[col], errors="coerce").fillna(0.0)
 
@@ -893,22 +910,18 @@ def page_calendar(df: pd.DataFrame):
     with st.expander("Detaljer per betalning"):
         st.dataframe(cal.sort_values("Datum"), use_container_width=True)
 
-# ── Del 5 ─────────────────────────────────────────────────────────────────
-# ── Transaktionslogg (stomme – frivilligt att använda) ────────────────────
+# ── Transaktionslogg (stomme, kan aktiveras vid behov) ────────────────────
 def _ensure_tx_sheet():
     sh = _open_sheet()
     try:
         return sh.worksheet(TX_SHEET)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=TX_SHEET, rows=1000, cols=8)
-        ws.update(
-            [["Datum","Ticker","Bolagsnamn","Antal","Kurs","Valuta","Total SEK","Kommentar"]],
-            value_input_option="RAW"
-        )
+        ws.update([["Datum","Ticker","Bolagsnamn","Antal","Kurs","Valuta","Total SEK","Kommentar"]],
+                  value_input_option="RAW")
         return ws
 
 def logga_transaktioner(rows: list):
-    """rows = [[ticker, namn, antal, kurs, valuta, total_sek, kommentar], ...]"""
     ws = _ensure_tx_sheet()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     out = []
@@ -917,7 +930,7 @@ def logga_transaktioner(rows: list):
     if out:
         ws.append_rows(out, value_input_option="RAW")
 
-# ── Massuppdatering (Yahoo) ───────────────────────────────────────────────
+# ── Massuppdatering ───────────────────────────────────────────────────────
 def page_mass_update(df: pd.DataFrame) -> pd.DataFrame:
     st.subheader("⏩ Massuppdatera alla bolag (Yahoo)")
     base = säkerställ_kolumner(df).copy()
@@ -928,24 +941,18 @@ def page_mass_update(df: pd.DataFrame) -> pd.DataFrame:
     if st.button("Starta massuppdatering"):
         progress = st.progress(0)
         status   = st.empty()
-        tickers  = base["Ticker"].astype(str).str.strip().tolist()
-        N = len(tickers)
-
-        for i, tkr in enumerate(tickers, start=1):
-            if not tkr:
-                progress.progress(int(i*100/N))
-                continue
+        N = len(base)
+        for i, tkr in enumerate(base["Ticker"].tolist(), start=1):
             status.write(f"Uppdaterar {tkr} ({i}/{N}) …")
             vals = fetch_yahoo(tkr)
             m = base["Ticker"]==tkr
             for k in ["Aktuell kurs","Valuta","Bolagsnamn","Utdelning/år","Frekvens/år","Ex-Date","Källa"]:
-                if k in vals and vals[k] not in (None, ""):
-                    base.loc[m, k] = vals[k]
+                if k in vals and vals[k] not in (None,""):
+                    base.loc[m,k] = vals[k]
             base = beräkna_allt(base)
             base = uppdatera_nästa_utd(base)
             progress.progress(int(i*100/N))
-            time.sleep(1.0)  # respekt mot Yahoo/kvoter
-
+            time.sleep(1.0)  # respekt mot Yahoo
         st.session_state["working_df"] = base
         st.success("Massuppdatering klar (i minnet). Gå till 💾 Spara för att skriva till Sheets.")
     return st.session_state.get("working_df", base)
@@ -953,18 +960,13 @@ def page_mass_update(df: pd.DataFrame) -> pd.DataFrame:
 # ── Spara ─────────────────────────────────────────────────────────────────
 def page_save(df: pd.DataFrame):
     st.subheader("💾 Spara nu till Google Sheets")
-
     preview = uppdatera_nästa_utd(beräkna_allt(säkerställ_kolumner(df)))
     st.write("Rader som sparas:", len(preview))
-
-    # Visa en kompakt förhandsgranskning
-    cols_preview = [
-        "Ticker","Bolagsnamn","Valuta","Kategori","Antal aktier","GAV",
-        "Aktuell kurs","Utdelning/år","Kurs (SEK)","Årlig utdelning (SEK)"
-    ]
-    show_cols = [c for c in cols_preview if c in preview.columns]
-    st.dataframe(preview[show_cols], use_container_width=True)
-
+    st.dataframe(
+        preview[["Ticker","Bolagsnamn","Valuta","Kategori","Antal aktier","GAV","Aktuell kurs","Utdelning/år","Kurs (SEK)","Årlig utdelning (SEK)"]],
+        use_container_width=True
+    )
+    danger = st.checkbox("⚠️ Tillåt riskabel överskrivning (anti-wipe skyddar ändå)", value=False)
     if st.button("✅ Bekräfta och spara"):
         spara_data(preview)  # anti-wipe & format-skydd inuti
         st.success("Sparat till Sheets.")
@@ -973,14 +975,14 @@ def page_save(df: pd.DataFrame):
 def main():
     st.title("Relative Yield – utdelningsportfölj")
 
-    # Initiera in-memory tabellen från Google Sheets en gång per session
+    # Initiera in-memory tabellen från Google Sheets en gång
     if "working_df" not in st.session_state:
         try:
             st.session_state["working_df"] = hamta_data()
         except Exception:
             st.session_state["working_df"] = säkerställ_kolumner(pd.DataFrame())
 
-    # Kör autosnap var 5:e minut (säkerhetskopia av huvudbladet)
+    # Kör autosnap var 5 min (säkerhetskopia av huvudbladet)
     autosnap_if_due(300)
 
     # Sidebar (FX + snabb “uppdatera EN” + backup)
@@ -1018,7 +1020,6 @@ def main():
     elif page == "💾 Spara":
         page_save(base)
 
-    # Skriv tillbaka in-memory-tabellen till sessionen
     st.session_state["working_df"] = säkerställ_kolumner(base)
 
 if __name__ == "__main__":
