@@ -494,19 +494,42 @@ def beräkna_allt(df: pd.DataFrame) -> pd.DataFrame:
 
     return d
 
+# ── FX text-input helper (ENDA ändringen) ─────────────────────────────────
+def _fx_text_input(key: str, label: str):
+    """
+    Text-input för FX som tillåter att rensa fältet och skriva nytt.
+    Parsar robust (komma/punkt/kolon, extra tecken) och behåller senaste giltiga
+    värdet om fältet är tomt.
+    """
+    current = float(st.session_state.get(key, DEF_FX[key]))
+    txt_key = f"{key}_txt"
+    if txt_key not in st.session_state:
+        st.session_state[txt_key] = f"{current:.4f}"
+    s = st.text_input(label, value=st.session_state[txt_key], key=txt_key, placeholder=f"{current:.4f}")
+    if s.strip() == "":
+        parsed = current
+    else:
+        parsed = _repair_numeric_str(s)
+        if parsed <= 0:
+            parsed = current
+    st.session_state[key] = float(parsed)
+    return float(parsed)
+
 # ── Sidebar: Växelkurser + snabb EN-uppdatering + manuell backup ─────────
 def sidebar_tools():
     st.sidebar.header("⚙️ Inställningar")
     st.sidebar.markdown("**Växelkurser (SEK)**")
     c1, c2 = st.sidebar.columns(2)
     with c1:
-        st.session_state["USDSEK"] = st.number_input("USD/SEK", 0.0, value=float(st.session_state["USDSEK"]), step=0.01, format="%.4f")
-        st.session_state["EURSEK"] = st.number_input("EUR/SEK", 0.0, value=float(st.session_state["EURSEK"]), step=0.01, format="%.4f")
+        _fx_text_input("USDSEK", "USD/SEK")
+        _fx_text_input("EURSEK", "EUR/SEK")
     with c2:
-        st.session_state["CADSEK"] = st.number_input("CAD/SEK", 0.0, value=float(st.session_state["CADSEK"]), step=0.01, format="%.4f")
-        st.session_state["NOKSEK"] = st.number_input("NOK/SEK", 0.0, value=float(st.session_state["NOKSEK"]), step=0.01, format="%.4f")
+        _fx_text_input("CADSEK", "CAD/SEK")
+        _fx_text_input("NOKSEK", "NOK/SEK")
     if st.sidebar.button("↩︎ Återställ FX"):
-        for k,v in DEF_FX.items(): st.session_state[k] = v
+        for k,v in DEF_FX.items():
+            st.session_state[k] = v
+            st.session_state[f"{k}_txt"] = f"{v:.4f}"
         st.sidebar.success("Standardkurser återställda.")
 
     st.sidebar.markdown("---")
